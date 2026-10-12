@@ -449,7 +449,18 @@ fn mcp_serve() -> Result<()> {
             "tools/list" => {
                 let tools: Vec<Value> = MCP_TOOLS
                     .iter()
-                    .map(|(n, d, s)| json!({"name": n, "description": d, "inputSchema": serde_json::from_str::<Value>(s).unwrap()}))
+                    .map(|(n, d, s)| {
+                        json!({
+                            "name": n,
+                            "description": d,
+                            "inputSchema": serde_json::from_str::<Value>(s).unwrap(),
+                            "annotations": {
+                                "readOnlyHint": true,
+                                "destructiveHint": false,
+                                "openWorldHint": true
+                            }
+                        })
+                    })
                     .collect();
                 writeln!(
                     stdout,

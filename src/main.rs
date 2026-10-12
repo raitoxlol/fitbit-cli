@@ -49,11 +49,16 @@ fn tokens_path() -> Result<PathBuf> {
         })
         .collect();
     files.sort();
-    files.pop().context("no tokens — run `fitbit-cli auth` first")
+    files
+        .pop()
+        .context("no tokens — run `fitbit-cli auth` first")
 }
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn load_tokens() -> Result<(PathBuf, Tokens)> {
@@ -153,9 +158,12 @@ fn cmd_auth() -> Result<()> {
     let mut pasted = String::new();
     std::io::stdin().lock().read_line(&mut pasted)?;
     let pasted = pasted.trim();
-    let q = url::Url::parse(pasted)
-        .ok()
-        .and_then(|u| u.query_pairs().into_owned().collect::<std::collections::HashMap<_, _>>().into());
+    let q = url::Url::parse(pasted).ok().and_then(|u| {
+        u.query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>()
+            .into()
+    });
     let q: std::collections::HashMap<String, String> = q.unwrap_or_default();
     let code = q.get("code").cloned().unwrap_or_default();
     if code.is_empty() {
@@ -190,12 +198,20 @@ fn cmd_auth() -> Result<()> {
         refresh_token: td["refresh_token"].as_str().unwrap().to_string(),
         token_expires_at: now() + td["expires_in"].as_i64().unwrap_or(28800),
         user_id: user["encodedId"].as_str().unwrap_or("unknown").to_string(),
-        display_name: user["displayName"].as_str().unwrap_or("unknown").to_string(),
+        display_name: user["displayName"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string(),
     };
     fs::create_dir_all(tokens_dir())?;
     let p = tokens_dir().join(format!("tokens-{}.json", t.user_id));
     save_tokens(&p, &t)?;
-    println!("\nSaved {}\nAuthorized: {} ({})", p.display(), t.display_name, t.user_id);
+    println!(
+        "\nSaved {}\nAuthorized: {} ({})",
+        p.display(),
+        t.display_name,
+        t.user_id
+    );
     println!("Now: `fitbit-cli pull today` — or `fitbit-cli mcp` for agents.");
     Ok(())
 }
@@ -220,10 +236,22 @@ fn shortcuts() -> &'static [(&'static str, &'static str)] {
         ("today", "1/user/-/activities/date/today.json"),
         ("summary", "1/user/-/activities/date/today.json"),
         ("steps", "1/user/-/activities/steps/date/today/1d/1min.json"),
-        ("distance", "1/user/-/activities/distance/date/today/1d/1min.json"),
-        ("floors", "1/user/-/activities/floors/date/today/1d/1min.json"),
-        ("calories", "1/user/-/activities/calories/date/today/1d/1min.json"),
-        ("azm", "1/user/-/activities/active-zone-minutes/date/today/1d.json"),
+        (
+            "distance",
+            "1/user/-/activities/distance/date/today/1d/1min.json",
+        ),
+        (
+            "floors",
+            "1/user/-/activities/floors/date/today/1d/1min.json",
+        ),
+        (
+            "calories",
+            "1/user/-/activities/calories/date/today/1d/1min.json",
+        ),
+        (
+            "azm",
+            "1/user/-/activities/active-zone-minutes/date/today/1d.json",
+        ),
         ("hr", "1/user/-/activities/heart/date/today/1d/1min.json"),
         ("hr-summary", "1/user/-/activities/heart/date/today/1d.json"),
         ("sleep", "1.2/user/-/sleep/date/today.json"),
@@ -240,7 +268,10 @@ fn shortcuts() -> &'static [(&'static str, &'static str)] {
         ("friends", "1.1/user/-/friends/leaderboard.json"),
         ("leaderboard", "1.1/user/-/friends/leaderboard.json"),
         ("goals", "1/user/-/activities/goals/daily.json"),
-        ("activities", "1/user/-/activities/list.json?beforeDate=today&sort=desc&limit=20&offset=0"),
+        (
+            "activities",
+            "1/user/-/activities/list.json?beforeDate=today&sort=desc&limit=20&offset=0",
+        ),
         ("alarms", "1/user/-/devices/alarms.json"),
     ]
 }
@@ -260,7 +291,10 @@ fn resolve(name_or_path: &str, date: Option<&str>) -> String {
 
 fn chrono_today() -> String {
     // no chrono dep — local date via `date` is fine on unix
-    let out = std::process::Command::new("date").arg("+%Y-%m-%d").output().unwrap();
+    let out = std::process::Command::new("date")
+        .arg("+%Y-%m-%d")
+        .output()
+        .unwrap();
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -364,8 +398,15 @@ fn mcp_tool_call(name: &str, args: &Value) -> String {
             let mut buf = Vec::new();
             match load_tokens() {
                 Ok((_, t)) => {
-                    buf.extend(format!("account: {} ({})\ntoken expires in: {}m\n",
-                        t.display_name, t.user_id, (t.token_expires_at - now()) / 60).bytes());
+                    buf.extend(
+                        format!(
+                            "account: {} ({})\ntoken expires in: {}m\n",
+                            t.display_name,
+                            t.user_id,
+                            (t.token_expires_at - now()) / 60
+                        )
+                        .bytes(),
+                    );
                     match pull("1/user/-/devices.json") {
                         Ok((200, b)) => buf.extend(b.bytes()),
                         Ok((s, b)) => buf.extend(format!("devices: HTTP {s} {b}").bytes()),
@@ -410,21 +451,33 @@ fn mcp_serve() -> Result<()> {
                     .iter()
                     .map(|(n, d, s)| json!({"name": n, "description": d, "inputSchema": serde_json::from_str::<Value>(s).unwrap()}))
                     .collect();
-                writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}}))?;
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}})
+                )?;
                 stdout.flush()?;
             }
             "tools/call" => {
                 let name = req["params"]["name"].as_str().unwrap_or("");
                 let args = req["params"]["arguments"].clone();
                 let text = mcp_tool_call(name, &args);
-                writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"result":{
-                    "content":[{"type":"text","text":text}]
-                }}))?;
+                writeln!(
+                    stdout,
+                    "{}",
+                    json!({"jsonrpc":"2.0","id":id,"result":{
+                        "content":[{"type":"text","text":text}]
+                    }})
+                )?;
                 stdout.flush()?;
             }
             _ => {
                 if !id.is_null() {
-                    writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}}))?;
+                    writeln!(
+                        stdout,
+                        "{}",
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}})
+                    )?;
                     stdout.flush()?;
                 }
             }
@@ -436,7 +489,11 @@ fn mcp_serve() -> Result<()> {
 // -----------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "fitbit-cli", version, about = "Pull your own Fitbit data, live, anytime")]
+#[command(
+    name = "fitbit-cli",
+    version,
+    about = "Pull your own Fitbit data, live, anytime"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

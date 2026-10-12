@@ -14,7 +14,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const API: &str = "https://android-api.fitbit.com";
@@ -49,9 +49,47 @@ fn tokens_path() -> Result<PathBuf> {
         })
         .collect();
     files.sort();
-    files
+    let p = files
         .pop()
-        .context("no tokens — run `fitbit-cli auth` first")
+        .context("no tokens — run `fitbit-cli auth` first")?;
+    // tighten pre-existing installs (older versions wrote world-readable files)
+    #[cfg(unix)]
+    {
+        let _ = private_dir(&tokens_dir());
+        let _ = chmod(&p, 0o600);
+    }
+    Ok(p)
+}
+
+#[cfg(unix)]
+fn chmod(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Create dir if needed and force 0700 on unix — it holds refresh tokens.
+fn private_dir(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    chmod(dir, 0o700)?;
+    Ok(())
+}
+
+/// Open a file owner-only on unix; also force 0600 on pre-existing files
+/// (OpenOptions::mode only applies at creation).
+fn private_file(path: &Path) -> Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let f = opts.open(path)?;
+    #[cfg(unix)]
+    chmod(path, 0o600)?;
+    Ok(f)
 }
 
 fn now() -> i64 {
@@ -67,12 +105,15 @@ fn load_tokens() -> Result<(PathBuf, Tokens)> {
     Ok((p, t))
 }
 
-fn save_tokens(p: &PathBuf, t: &Tokens) -> Result<()> {
-    fs::write(p, serde_json::to_string_pretty(t)?)?;
+fn save_tokens(p: &Path, t: &Tokens) -> Result<()> {
+    if let Some(dir) = p.parent() {
+        private_dir(dir)?;
+    }
+    private_file(p)?.write_all(serde_json::to_string_pretty(t)?.as_bytes())?;
     Ok(())
 }
 
-fn refresh_tokens(path: &PathBuf, t: &mut Tokens) -> Result<()> {
+fn refresh_tokens(path: &Path, t: &mut Tokens) -> Result<()> {
     let resp: Value = reqwest::blocking::Client::new()
         .post(format!("{API}/oauth2/token"))
         .form(&[
@@ -203,7 +244,6 @@ fn cmd_auth() -> Result<()> {
             .unwrap_or("unknown")
             .to_string(),
     };
-    fs::create_dir_all(tokens_dir())?;
     let p = tokens_dir().join(format!("tokens-{}.json", t.user_id));
     save_tokens(&p, &t)?;
     println!(
@@ -537,5 +577,43 @@ fn main() -> Result<()> {
         Cmd::Pull { path, date, out } => cmd_pull(path.as_deref(), date, out),
         Cmd::Status => cmd_status(),
         Cmd::Mcp => mcp_serve(),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn save_tokens_tightens_dir_and_file_perms() {
+        let dir = std::env::temp_dir().join(format!("fitbit-cli-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let p = dir.join("tokens-test.json");
+        fs::write(&p, "{}").unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let t = Tokens {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            token_expires_at: 0,
+            user_id: "u".into(),
+            display_name: "d".into(),
+        };
+        save_tokens(&p, &t).unwrap();
+
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_to_string(&p)
+            .unwrap()
+            .contains("\"access_token\": \"a\""));
+        fs::remove_dir_all(&dir).ok();
     }
 }

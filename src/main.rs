@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{BufRead, Read, Write};
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const API: &str = "https://android-api.fitbit.com";
 const AUTHORIZE: &str = "https://www.fitbit.com/oauth2/authorize";
@@ -33,12 +33,14 @@ struct Tokens {
     display_name: String,
 }
 
-fn tokens_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").unwrap()).join(".fitbit-export")
+fn tokens_dir() -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("could not locate home directory")?
+        .join(".fitbit-export"))
 }
 
-fn tokens_path() -> Result<PathBuf> {
-    let mut files: Vec<_> = fs::read_dir(tokens_dir())
+fn token_files() -> Result<Vec<PathBuf>> {
+    let mut files: Vec<_> = fs::read_dir(tokens_dir()?)
         .context("no tokens — run `fitbit-cli auth` first")?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
@@ -49,38 +51,96 @@ fn tokens_path() -> Result<PathBuf> {
         })
         .collect();
     files.sort();
-    files.pop().context("no tokens — run `fitbit-cli auth` first")
+    Ok(files)
+}
+
+fn tokens_path(user: Option<&str>) -> Result<PathBuf> {
+    let files = token_files()?;
+    if files.is_empty() {
+        bail!("no tokens — run `fitbit-cli auth` first");
+    }
+    let user = user.map(str::to_owned).or_else(|| std::env::var("FITBIT_USER").ok());
+    if let Some(u) = user {
+        let target = format!("tokens-{u}.json");
+        return files
+            .into_iter()
+            .find(|p| p.file_name().and_then(|n| n.to_str()) == Some(target.as_str()))
+            .with_context(|| format!("no tokens file for user '{u}' — run `fitbit-cli auth`"));
+    }
+    if files.len() > 1 {
+        let ids: Vec<String> = files
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(|n| n.to_string()))
+            .collect();
+        bail!("multiple accounts: {} — re-run with --user <id> (or set FITBIT_USER)", ids.join(", "));
+    }
+    Ok(files.into_iter().next().unwrap())
 }
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
 }
 
-fn load_tokens() -> Result<(PathBuf, Tokens)> {
-    let p = tokens_path()?;
-    let t: Tokens = serde_json::from_str(&fs::read_to_string(&p)?)?;
+fn load_tokens(user: Option<&str>) -> Result<(PathBuf, Tokens)> {
+    let p = tokens_path(user)?;
+    let t: Tokens = serde_json::from_str(&fs::read_to_string(&p)?)
+        .with_context(|| format!("bad tokens file {}", p.display()))?;
     Ok((p, t))
 }
 
-fn save_tokens(p: &PathBuf, t: &Tokens) -> Result<()> {
-    fs::write(p, serde_json::to_string_pretty(t)?)?;
+/// Atomic write: temp file + rename, 0600 on unix.
+fn save_tokens(p: &Path, t: &Tokens) -> Result<()> {
+    let tmp = p.with_file_name(format!(
+        ".{}.tmp",
+        p.file_name().and_then(|n| n.to_str()).unwrap_or("tokens")
+    ));
+    fs::write(&tmp, serde_json::to_string_pretty(t)?)?;
+    set_private_perms(&tmp, 0o600);
+    fs::rename(&tmp, p)?;
     Ok(())
 }
 
-fn refresh_tokens(path: &PathBuf, t: &mut Tokens) -> Result<()> {
-    let resp: Value = reqwest::blocking::Client::new()
-        .post(format!("{API}/oauth2/token"))
-        .form(&[
+#[cfg(unix)]
+fn set_private_perms(p: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(p, fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn set_private_perms(_p: &Path, _mode: u32) {}
+
+fn client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// POST helper: on non-2xx, include the response body in the error.
+fn post_form(url: &str, form: &[(&str, &str)]) -> Result<Value> {
+    let resp = client()?.post(url).form(form).send().context("request failed")?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!("{status}: {}", body.chars().take(300).collect::<String>());
+    }
+    serde_json::from_str(&body).context("token endpoint returned non-JSON")
+}
+
+fn refresh_tokens(path: &Path, t: &mut Tokens) -> Result<()> {
+    let resp = post_form(
+        &format!("{API}/oauth2/token"),
+        &[
             ("grant_type", "refresh_token"),
-            ("refresh_token", &t.refresh_token),
+            ("refresh_token", t.refresh_token.as_str()),
             ("client_id", CLIENT_ID),
-        ])
-        .send()
-        .context("refresh request failed")?
-        .error_for_status()
-        .context("refresh rejected")?
-        .json()?;
-    t.access_token = resp["access_token"].as_str().unwrap().to_string();
+        ],
+    )
+    .context("refresh rejected")?;
+    t.access_token = resp["access_token"]
+        .as_str()
+        .context("refresh response missing access_token")?
+        .to_string();
     if let Some(r) = resp["refresh_token"].as_str() {
         t.refresh_token = r.to_string();
     }
@@ -90,13 +150,9 @@ fn refresh_tokens(path: &PathBuf, t: &mut Tokens) -> Result<()> {
     save_tokens(path, t)
 }
 
-fn api_get(path: &str, access: &str) -> Result<(u16, String)> {
-    let url = if path.starts_with("http") {
-        path.to_string()
-    } else {
-        format!("{API}/{}", path.trim_start_matches('/'))
-    };
-    let resp = reqwest::blocking::Client::new()
+fn api_get(url_or_path: &str, access: &str) -> Result<(u16, String)> {
+    let url = checked_url(url_or_path)?;
+    let resp = client()?
         .get(&url)
         .header("Authorization", format!("Bearer {access}"))
         .header("Accept-Language", "en_US")
@@ -106,9 +162,25 @@ fn api_get(path: &str, access: &str) -> Result<(u16, String)> {
     Ok((status, resp.text()?))
 }
 
+/// Resolve a user-supplied pull target to a URL the token may be sent to.
+/// Only Fitbit-owned hosts over https — never leak the Bearer elsewhere.
+fn checked_url(target: &str) -> Result<String> {
+    let path = resolve(target, None)?;
+    if !(path.starts_with("http://") || path.starts_with("https://")) {
+        return Ok(format!("{API}/{}", path.trim_start_matches('/')));
+    }
+    let u = url::Url::parse(&path).context("bad URL")?;
+    let host = u.host_str().unwrap_or("").to_lowercase();
+    let ok = u.scheme() == "https" && (host == "fitbit.com" || host.ends_with(".fitbit.com"));
+    if !ok {
+        bail!("refusing to send credentials to non-Fitbit host '{host}'");
+    }
+    Ok(path)
+}
+
 /// GET with auto-refresh on expiry and one retry on 401.
-fn pull(path: &str) -> Result<(u16, String)> {
-    let (tp, mut t) = load_tokens()?;
+fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
+    let (tp, mut t) = load_tokens(user)?;
     if t.token_expires_at < now() + 60 {
         eprintln!("token expiring — refreshing via android-api…");
         refresh_tokens(&tp, &mut t)?;
@@ -122,31 +194,21 @@ fn pull(path: &str) -> Result<(u16, String)> {
 }
 
 fn cmd_auth() -> Result<()> {
-    let mut v = [0u8; 64];
-    let _ = getrandom_bytes(&mut v);
-    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
+    let verifier = random_b64(64)?;
     let challenge = {
         let mut h = Sha256::new();
         h.update(verifier.as_bytes());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
     };
-    let state = url::form_urlencoded::byte_serialize(secrets_32().as_bytes()).collect::<String>();
+    let state = url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect::<String>();
     let url = format!(
         "{AUTHORIZE}?client_id={CLIENT_ID}&redirect_uri={}&response_type=code&state={state}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
         url::form_urlencoded::byte_serialize(REDIRECT.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
     );
     println!("Open this URL in any browser to authorize:\n{url}\n");
-    // best-effort auto-open — harmless if the OS lacks an opener
-    for opener in ["open", "xdg-open", "rundll32 url.dll,FileProtocolHandler"] {
-        if std::process::Command::new("sh")
-            .args(["-c", &format!("{opener} '{url}' >/dev/null 2>&1")])
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            eprintln!("(opened in your default browser)");
-            break;
-        }
+    if try_open_browser(&url) {
+        eprintln!("(opened in your default browser)");
     }
     print!("After approving, the browser lands on a localhost:8080 URL that fails to\nload — copy the full URL and paste it here: ");
     std::io::stdout().flush()?;
@@ -165,21 +227,22 @@ fn cmd_auth() -> Result<()> {
         bail!("state mismatch — wrong URL?");
     }
 
-    let td: Value = reqwest::blocking::Client::new()
-        .post(format!("{API}/oauth2/token"))
-        .form(&[
+    let td = post_form(
+        &format!("{API}/oauth2/token"),
+        &[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
             ("redirect_uri", REDIRECT),
             ("client_id", CLIENT_ID),
             ("code_verifier", verifier.as_str()),
-        ])
-        .send()?
-        .error_for_status()
-        .context("token exchange failed")?
-        .json()?;
+        ],
+    )
+    .context("token exchange failed")?;
 
-    let access = td["access_token"].as_str().unwrap().to_string();
+    let access = td["access_token"]
+        .as_str()
+        .context("token response missing access_token")?
+        .to_string();
     let (st, body) = api_get("1/user/-/profile.json", &access)?;
     if st != 200 {
         bail!("profile fetch failed ({st}): {body}");
@@ -187,29 +250,39 @@ fn cmd_auth() -> Result<()> {
     let user = &serde_json::from_str::<Value>(&body)?["user"];
     let t = Tokens {
         access_token: access,
-        refresh_token: td["refresh_token"].as_str().unwrap().to_string(),
+        refresh_token: td["refresh_token"]
+            .as_str()
+            .context("token response missing refresh_token")?
+            .to_string(),
         token_expires_at: now() + td["expires_in"].as_i64().unwrap_or(28800),
         user_id: user["encodedId"].as_str().unwrap_or("unknown").to_string(),
         display_name: user["displayName"].as_str().unwrap_or("unknown").to_string(),
     };
-    fs::create_dir_all(tokens_dir())?;
-    let p = tokens_dir().join(format!("tokens-{}.json", t.user_id));
+    let dir = tokens_dir()?;
+    fs::create_dir_all(&dir)?;
+    set_private_perms(&dir, 0o700);
+    let p = dir.join(format!("tokens-{}.json", t.user_id));
     save_tokens(&p, &t)?;
     println!("\nSaved {}\nAuthorized: {} ({})", p.display(), t.display_name, t.user_id);
     println!("Now: `fitbit-cli pull today` — or `fitbit-cli mcp` for agents.");
     Ok(())
 }
 
-fn secrets_32() -> String {
-    let mut v = [0u8; 32];
-    let _ = getrandom_bytes(&mut v);
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v)
+/// Best-effort browser open; false if the platform opener failed.
+fn try_open_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    let cmd = std::process::Command::new("open").arg(url).status();
+    #[cfg(windows)]
+    let cmd = std::process::Command::new("cmd").args(["/C", "start", "", url]).status();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = std::process::Command::new("xdg-open").arg(url).status();
+    cmd.is_ok_and(|s| s.success())
 }
 
-fn getrandom_bytes(v: &mut [u8]) -> Result<()> {
-    use std::fs::File;
-    File::open("/dev/urandom")?.read_exact(v)?;
-    Ok(())
+fn random_b64(n: usize) -> Result<String> {
+    let mut v = vec![0u8; n];
+    getrandom::fill(&mut v).map_err(|e| anyhow::anyhow!("OS RNG unavailable: {e}"))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v))
 }
 
 fn shortcuts() -> &'static [(&'static str, &'static str)] {
@@ -245,48 +318,104 @@ fn shortcuts() -> &'static [(&'static str, &'static str)] {
     ]
 }
 
-fn resolve(name_or_path: &str, date: Option<&str>) -> String {
-    let today = chrono_today();
-    let mut p = shortcuts()
-        .iter()
-        .find(|(n, _)| *n == name_or_path)
-        .map(|(_, v)| v.to_string())
-        .unwrap_or_else(|| name_or_path.to_string());
+fn resolve(name_or_path: &str, date: Option<&str>) -> Result<String> {
+    if let Some(d) = date {
+        valid_date(d)?;
+    }
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let mut p = match shortcuts().iter().find(|(n, _)| *n == name_or_path) {
+        Some((_, v)) => v.to_string(),
+        None => {
+            if !plausible_target(name_or_path) {
+                let hint = suggest(name_or_path)
+                    .map(|s| format!(" — did you mean '{s}'?"))
+                    .unwrap_or_default();
+                bail!("unknown shortcut '{name_or_path}'{hint}\nrun `fitbit-cli pull` to list shortcuts; raw paths look like '1/user/-/...'");
+            }
+            name_or_path.to_string()
+        }
+    };
     if p.contains("today") {
         p = p.replace("today", date.unwrap_or(&today));
     }
-    p
+    Ok(p)
 }
 
-fn chrono_today() -> String {
-    // no chrono dep — local date via `date` is fine on unix
-    let out = std::process::Command::new("date").arg("+%Y-%m-%d").output().unwrap();
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
-}
-
-fn print_body(_status: u16, body: &str, out: Option<&str>) {
-    match serde_json::from_str::<Value>(body) {
-        Ok(v) => {
-            let pretty = serde_json::to_string_pretty(&v).unwrap();
-            if let Some(f) = out {
-                let _ = fs::write(f, &pretty);
-                eprintln!("saved -> {f}");
-            } else {
-                println!("{pretty}");
-            }
-        }
-        Err(_) => {
-            if let Some(f) = out {
-                let _ = fs::write(f, body);
-                eprintln!("saved -> {f}");
-            } else {
-                println!("{body}");
-            }
-        }
+/// Accept API-version paths ('1/...', '1.2/...') or https URLs.
+fn plausible_target(s: &str) -> bool {
+    if s.starts_with("http://") || s.starts_with("https://") {
+        return true;
     }
+    let ver_end = s.find('/');
+    matches!(ver_end, Some(i) if i >= 1
+        && s[..i].chars().all(|c| c.is_ascii_digit() || c == '.')
+        && s[..i].chars().any(|c| c.is_ascii_digit()))
+        && !s.contains("..")
 }
 
-fn cmd_pull(path: Option<&str>, date: Option<String>, out: Option<String>) -> Result<()> {
+fn valid_date(d: &str) -> Result<()> {
+    let b = d.as_bytes();
+    let ok = b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit());
+    if !ok {
+        bail!("bad date '{d}' — expected YYYY-MM-DD");
+    }
+    Ok(())
+}
+
+fn suggest(input: &str) -> Option<&'static str> {
+    shortcuts()
+        .iter()
+        .map(|(n, _)| *n)
+        .min_by_key(|n| levenshtein(input, n))
+        .filter(|n| levenshtein(input, n) <= 2)
+}
+
+fn levenshtein(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            cur.push((prev[j] + usize::from(ca != cb)).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
+
+/// Refuse `--out` targets inside the credentials dir (don't clobber tokens).
+fn check_out_path(f: &str) -> Result<()> {
+    let dir = tokens_dir()?;
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let out = Path::new(f);
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    if parent.starts_with(&dir) {
+        bail!("refusing to write into the credentials dir ({})", dir.display());
+    }
+    Ok(())
+}
+
+fn print_body(_status: u16, body: &str, out: Option<&str>) -> Result<()> {
+    let text = match serde_json::from_str::<Value>(body) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_else(|_| body.to_string()),
+        Err(_) => body.to_string(),
+    };
+    match out {
+        Some(f) => {
+            check_out_path(f)?;
+            fs::write(f, &text).with_context(|| format!("failed to write {f}"))?;
+            eprintln!("saved -> {f}");
+        }
+        None => println!("{text}"),
+    }
+    Ok(())
+}
+
+fn cmd_pull(path: Option<&str>, date: Option<String>, out: Option<String>, user: Option<String>) -> Result<()> {
     let Some(path) = path else {
         eprintln!("pick a shortcut or give a raw API path:\n");
         for (n, p) in shortcuts() {
@@ -295,25 +424,25 @@ fn cmd_pull(path: Option<&str>, date: Option<String>, out: Option<String>) -> Re
         eprintln!("\n  fitbit-cli pull today            # shortcut\n  fitbit-cli pull sleep 2026-10-01 # any date\n  fitbit-cli pull '1/user/-/...'   # raw path\n");
         std::process::exit(2);
     };
-    let (status, body) = pull(&resolve(path, date.as_deref()))?;
+    let (status, body) = pull(&resolve(path, date.as_deref())?, user.as_deref())?;
     if status == 429 {
         eprintln!("rate limited — ~150 req/hr shared with the app; wait a few minutes and retry");
     } else if status != 200 {
         eprintln!("HTTP {status}");
     }
-    print_body(status, &body, out.as_deref());
+    print_body(status, &body, out.as_deref())?;
     if status != 200 {
         std::process::exit(1);
     }
     Ok(())
 }
 
-fn cmd_status() -> Result<()> {
-    let (_, t) = load_tokens()?;
+fn cmd_status(user: Option<String>) -> Result<()> {
+    let (_, t) = load_tokens(user.as_deref())?;
     let mins = (t.token_expires_at - now()) / 60;
     println!("account: {} ({})", t.display_name, t.user_id);
     println!("token expires in: {mins}m (auto-refreshes on pull)");
-    match pull("1/user/-/devices.json") {
+    match pull("1/user/-/devices.json", user.as_deref()) {
         Ok((200, body)) => {
             let devs: Value = serde_json::from_str(&body)?;
             for d in devs.as_array().unwrap_or(&vec![]) {
@@ -344,39 +473,42 @@ const MCP_TOOLS: &[(&str, &str, &str)] = &[
      r#"{"type":"object","properties":{}}"#),
 ];
 
-fn mcp_tool_call(name: &str, args: &Value) -> String {
+/// Returns (text, isError) per the MCP tool-result contract.
+fn mcp_tool_call(name: &str, args: &Value) -> Result<(String, bool)> {
+    let user = args["user"].as_str().map(str::to_owned);
     match name {
         "pull" => {
             let p = args["path"].as_str().unwrap_or("");
             let d = args["date"].as_str().unwrap_or("");
-            match pull(&resolve(p, if d.is_empty() { None } else { Some(d) })) {
-                Ok((200, b)) => b,
-                Ok((s, b)) => format!("HTTP {s}\n{b}"),
-                Err(e) => format!("error: {e}"),
+            let target = resolve(p, if d.is_empty() { None } else { Some(d) })?;
+            match pull(&target, user.as_deref()) {
+                Ok((200, b)) => Ok((b, false)),
+                Ok((s, b)) => Ok((format!("HTTP {s}\n{b}"), true)),
+                Err(e) => Ok((format!("error: {e}"), true)),
             }
         }
-        "list_pulls" => shortcuts()
+        "list_pulls" => Ok((shortcuts()
             .iter()
             .map(|(n, p)| format!("{n}  ->  {p}"))
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join("\n"), false)),
         "status" => {
-            let mut buf = Vec::new();
-            match load_tokens() {
+            let mut buf = String::new();
+            match load_tokens(user.as_deref()) {
                 Ok((_, t)) => {
-                    buf.extend(format!("account: {} ({})\ntoken expires in: {}m\n",
-                        t.display_name, t.user_id, (t.token_expires_at - now()) / 60).bytes());
-                    match pull("1/user/-/devices.json") {
-                        Ok((200, b)) => buf.extend(b.bytes()),
-                        Ok((s, b)) => buf.extend(format!("devices: HTTP {s} {b}").bytes()),
-                        Err(e) => buf.extend(format!("devices: {e}").bytes()),
+                    buf.push_str(&format!("account: {} ({})\ntoken expires in: {}m\n",
+                        t.display_name, t.user_id, (t.token_expires_at - now()) / 60));
+                    match pull("1/user/-/devices.json", user.as_deref()) {
+                        Ok((200, b)) => buf.push_str(&b),
+                        Ok((s, b)) => buf.push_str(&format!("devices: HTTP {s} {b}")),
+                        Err(e) => buf.push_str(&format!("devices: {e}")),
                     }
-                    String::from_utf8_lossy(&buf).to_string()
+                    Ok((buf, false))
                 }
-                Err(e) => format!("no tokens: {e}"),
+                Err(e) => Ok((format!("no tokens: {e}"), true)),
             }
         }
-        _ => format!("unknown tool {name}"),
+        _ => bail!("unknown tool {name}"),
     }
 }
 
@@ -394,17 +526,24 @@ fn mcp_serve() -> Result<()> {
             Err(_) => continue,
         };
         let id = req["id"].clone();
+        // notifications carry no id and never get a response
+        if id.is_null() {
+            continue;
+        }
         match req["method"].as_str().unwrap_or("") {
             "initialize" => {
-                let resp = json!({"jsonrpc":"2.0","id":id,"result":{
-                    "protocolVersion":"2025-03-26",
+                let client_v = req["params"]["protocolVersion"].as_str().unwrap_or("2025-03-26");
+                writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"result":{
+                    "protocolVersion":client_v,
                     "capabilities":{"tools":{}},
                     "serverInfo":{"name":"fitbit-cli","version":env!("CARGO_PKG_VERSION")}
-                }});
-                writeln!(stdout, "{}", resp)?;
+                }}))?;
                 stdout.flush()?;
             }
-            "notifications/initialized" | "notifications/cancelled" | "ping" => {}
+            "ping" => {
+                writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"result":{}}))?;
+                stdout.flush()?;
+            }
             "tools/list" => {
                 let tools: Vec<Value> = MCP_TOOLS
                     .iter()
@@ -416,17 +555,21 @@ fn mcp_serve() -> Result<()> {
             "tools/call" => {
                 let name = req["params"]["name"].as_str().unwrap_or("");
                 let args = req["params"]["arguments"].clone();
-                let text = mcp_tool_call(name, &args);
-                writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"result":{
-                    "content":[{"type":"text","text":text}]
-                }}))?;
+                let resp = match mcp_tool_call(name, &args) {
+                    Ok((text, is_err)) => json!({"jsonrpc":"2.0","id":id,"result":{
+                        "content":[{"type":"text","text":text}],
+                        "isError":is_err
+                    }}),
+                    Err(e) => json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code":-32602,"message":format!("{e}")
+                    }}),
+                };
+                writeln!(stdout, "{}", resp)?;
                 stdout.flush()?;
             }
             _ => {
-                if !id.is_null() {
-                    writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}}))?;
-                    stdout.flush()?;
-                }
+                writeln!(stdout, "{}", json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}}))?;
+                stdout.flush()?;
             }
         }
     }
@@ -455,9 +598,16 @@ enum Cmd {
         /// Save the response body to a file instead of printing
         #[arg(long)]
         out: Option<String>,
+        /// Which tokens-<id>.json to use when several accounts exist (or FITBIT_USER)
+        #[arg(long)]
+        user: Option<String>,
     },
     /// Auth + device status
-    Status,
+    Status {
+        /// Which tokens-<id>.json to use when several accounts exist (or FITBIT_USER)
+        #[arg(long)]
+        user: Option<String>,
+    },
     /// stdio MCP server for agents
     Mcp,
 }
@@ -466,8 +616,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth => cmd_auth(),
-        Cmd::Pull { path, date, out } => cmd_pull(path.as_deref(), date, out),
-        Cmd::Status => cmd_status(),
+        Cmd::Pull { path, date, out, user } => cmd_pull(path.as_deref(), date, out, user),
+        Cmd::Status { user } => cmd_status(user),
         Cmd::Mcp => mcp_serve(),
     }
 }

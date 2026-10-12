@@ -11,13 +11,17 @@ approval, then tokens self-rotate forever. That host outlives the legacy
 ## Install
 
 ```sh
+# prebuilt binary — grab the latest release for your platform:
+# https://github.com/raitoxlol/fitbit-cli/releases/latest
+curl -L https://github.com/raitoxlol/fitbit-cli/releases/latest/download/fitbit-cli-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv fitbit-cli /usr/local/bin/   # or anywhere on PATH
+
 # from source (needs Rust)
 cargo install --git https://github.com/raitoxlol/fitbit-cli
-
-# or build locally
-git clone https://github.com/raitoxlol/fitbit-cli && cd fitbit-cli
-cargo build --release          # binary: target/release/fitbit-cli
 ```
+
+Binaries are published for macOS (Apple Silicon + Intel), Linux x86_64, and
+Windows on every `v*` tag.
 
 ## Quickstart (60 seconds)
 

@@ -1,0 +1,61 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip fitbit-cli || true
+          tar czf ../../../fitbit-cli-${{ matrix.target }}.tar.gz fitbit-cli
+          cd ../../..
+          shasum -a 256 fitbit-cli-${{ matrix.target }}.tar.gz > fitbit-cli-${{ matrix.target }}.sha256
+      - name: package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive target/${{ matrix.target }}/release/fitbit-cli.exe fitbit-cli-${{ matrix.target }}.zip
+          Get-FileHash fitbit-cli-${{ matrix.target }}.zip -Algorithm SHA256 | ForEach-Object { "$($_.Hash.ToLower())  fitbit-cli-${{ matrix.target }}.zip" } | Out-File -Encoding ascii fitbit-cli-${{ matrix.target }}.sha256
+      - name: upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            fitbit-cli-${{ matrix.target }}.tar.gz
+            fitbit-cli-${{ matrix.target }}.zip
+            fitbit-cli-${{ matrix.target }}.sha256
+          fail_on_unmatched_files: false
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

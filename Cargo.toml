@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Pull your own Fitbit data, live, anytime — via the private app API. No Google Cloud project, no expiring credentials."
 license = "MIT"
+repository = "https://github.com/raitoxlol/fitbit-cli"
+homepage = "https://github.com/raitoxlol/fitbit-cli"
+keywords = ["fitbit", "health", "api", "cli", "mcp"]
 
 [dependencies]
 anyhow = "1"

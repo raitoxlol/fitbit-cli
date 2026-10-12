@@ -52,6 +52,15 @@ spo2 hrv water food friends leaderboard goals activities alarms`
 Rate limit: ~150 requests/hour shared with the Fitbit app. A `429` means wait
 a few minutes — it's the app's own quota, nothing's broken.
 
+Safety notes:
+
+- Credentials are only ever sent to `*.fitbit.com` over https — full-URL pull
+  targets outside that are refused (protects agents using the MCP too).
+- Tokens are written `0600` inside a `0700` `~/.fitbit-export/` directory,
+  atomically (temp file + rename).
+- Multiple accounts: `pull`/`status` take `--user <id>` (or `FITBIT_USER`)
+  when several `tokens-*.json` files exist.
+
 ## As an MCP server (for agents)
 
 ```sh

@@ -137,6 +137,17 @@ fn cmd_auth() -> Result<()> {
         url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
     );
     println!("Open this URL in any browser to authorize:\n{url}\n");
+    // best-effort auto-open — harmless if the OS lacks an opener
+    for opener in ["open", "xdg-open", "rundll32 url.dll,FileProtocolHandler"] {
+        if std::process::Command::new("sh")
+            .args(["-c", &format!("{opener} '{url}' >/dev/null 2>&1")])
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("(opened in your default browser)");
+            break;
+        }
+    }
     print!("After approving, the browser lands on a localhost:8080 URL that fails to\nload — copy the full URL and paste it here: ");
     std::io::stdout().flush()?;
     let mut pasted = String::new();
@@ -207,14 +218,30 @@ fn shortcuts() -> &'static [(&'static str, &'static str)] {
         ("devices", "1/user/-/devices.json"),
         ("badges", "1/user/-/badges.json"),
         ("today", "1/user/-/activities/date/today.json"),
+        ("summary", "1/user/-/activities/date/today.json"),
         ("steps", "1/user/-/activities/steps/date/today/1d/1min.json"),
+        ("distance", "1/user/-/activities/distance/date/today/1d/1min.json"),
+        ("floors", "1/user/-/activities/floors/date/today/1d/1min.json"),
+        ("calories", "1/user/-/activities/calories/date/today/1d/1min.json"),
+        ("azm", "1/user/-/activities/active-zone-minutes/date/today/1d.json"),
         ("hr", "1/user/-/activities/heart/date/today/1d/1min.json"),
         ("hr-summary", "1/user/-/activities/heart/date/today/1d.json"),
         ("sleep", "1.2/user/-/sleep/date/today.json"),
+        ("sleep-goal", "1.2/user/-/sleep/goal.json"),
         ("weight", "1/user/-/body/log/weight/date/today.json"),
+        ("fat", "1/user/-/body/log/fat/date/today.json"),
         ("temp", "1/user/-/temp/skin/date/today.json"),
+        ("vo2", "1/user/-/cardioscore/date/today.json"),
+        ("breathing", "1/user/-/br/date/today/all.json"),
+        ("spo2", "1/user/-/spo/date/today/all.json"),
+        ("hrv", "1/user/-/hrv/date/today/all.json"),
+        ("water", "1/user/-/foods/log/water/date/today.json"),
+        ("food", "1/user/-/foods/log/date/today.json"),
         ("friends", "1.1/user/-/friends/leaderboard.json"),
+        ("leaderboard", "1.1/user/-/friends/leaderboard.json"),
         ("goals", "1/user/-/activities/goals/daily.json"),
+        ("activities", "1/user/-/activities/list.json?beforeDate=today&sort=desc&limit=20&offset=0"),
+        ("alarms", "1/user/-/devices/alarms.json"),
     ]
 }
 
@@ -237,19 +264,44 @@ fn chrono_today() -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
-fn print_body(status: u16, body: &str) {
-    if status != 200 {
-        eprintln!("HTTP {status}");
-    }
+fn print_body(_status: u16, body: &str, out: Option<&str>) {
     match serde_json::from_str::<Value>(body) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),
-        Err(_) => println!("{body}"),
+        Ok(v) => {
+            let pretty = serde_json::to_string_pretty(&v).unwrap();
+            if let Some(f) = out {
+                let _ = fs::write(f, &pretty);
+                eprintln!("saved -> {f}");
+            } else {
+                println!("{pretty}");
+            }
+        }
+        Err(_) => {
+            if let Some(f) = out {
+                let _ = fs::write(f, body);
+                eprintln!("saved -> {f}");
+            } else {
+                println!("{body}");
+            }
+        }
     }
 }
 
-fn cmd_pull(path: &str, date: Option<String>) -> Result<()> {
+fn cmd_pull(path: Option<&str>, date: Option<String>, out: Option<String>) -> Result<()> {
+    let Some(path) = path else {
+        eprintln!("pick a shortcut or give a raw API path:\n");
+        for (n, p) in shortcuts() {
+            eprintln!("  {n:<12} {p}");
+        }
+        eprintln!("\n  fitbit-cli pull today            # shortcut\n  fitbit-cli pull sleep 2026-10-01 # any date\n  fitbit-cli pull '1/user/-/...'   # raw path\n");
+        std::process::exit(2);
+    };
     let (status, body) = pull(&resolve(path, date.as_deref()))?;
-    print_body(status, &body);
+    if status == 429 {
+        eprintln!("rate limited — ~150 req/hr shared with the app; wait a few minutes and retry");
+    } else if status != 200 {
+        eprintln!("HTTP {status}");
+    }
+    print_body(status, &body, out.as_deref());
     if status != 200 {
         std::process::exit(1);
     }
@@ -310,9 +362,6 @@ fn mcp_tool_call(name: &str, args: &Value) -> String {
             .join("\n"),
         "status" => {
             let mut buf = Vec::new();
-            let _ = cmd_status().map_err(|e| e.to_string());
-            let _ = std::io::stdout().flush();
-            // capture not trivial — recompute instead
             match load_tokens() {
                 Ok((_, t)) => {
                     buf.extend(format!("account: {} ({})\ntoken expires in: {}m\n",
@@ -398,7 +447,15 @@ enum Cmd {
     /// One-time OAuth (approve in browser, paste back the URL)
     Auth,
     /// Live pull: `fitbit-cli pull today` or a raw API path
-    Pull { path: String, date: Option<String> },
+    Pull {
+        /// Shortcut name or raw API path (omit to list shortcuts)
+        path: Option<String>,
+        /// YYYY-MM-DD to substitute for 'today'
+        date: Option<String>,
+        /// Save the response body to a file instead of printing
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Auth + device status
     Status,
     /// stdio MCP server for agents
@@ -409,7 +466,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth => cmd_auth(),
-        Cmd::Pull { path, date } => cmd_pull(&path, date),
+        Cmd::Pull { path, date, out } => cmd_pull(path.as_deref(), date, out),
         Cmd::Status => cmd_status(),
         Cmd::Mcp => mcp_serve(),
     }

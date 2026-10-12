@@ -1,7 +1,7 @@
 # fitbit-cli
 
-Pull your own Fitbit data, live, anytime — a single Rust binary, no Google Cloud
-project, no expiring credentials.
+Pull your own Fitbit data, live, anytime — one small Rust binary, no Google
+Cloud project, no expiring credentials.
 
 It talks to `android-api.fitbit.com` — the private backend the real Fitbit app
 uses — with the same public OAuth client Fitbit's own tooling uses. One browser
@@ -11,40 +11,62 @@ approval, then tokens self-rotate forever. That host outlives the legacy
 ## Install
 
 ```sh
-cargo install --path .        # or: cargo build --release
+# from source (needs Rust)
+cargo install --git https://github.com/raitoxlol/fitbit-cli
+
+# or build locally
+git clone https://github.com/raitoxlol/fitbit-cli && cd fitbit-cli
+cargo build --release          # binary: target/release/fitbit-cli
 ```
 
-## Use
+## Quickstart (60 seconds)
 
 ```sh
-fitbit-cli auth                 # once — approve in any browser, paste back the URL
-fitbit-cli status               # token freshness + your tracker's battery
-fitbit-cli pull today           # today's steps/calories/active minutes
-fitbit-cli pull sleep           # last night
-fitbit-cli pull sleep 2026-10-05
-fitbit-cli pull '1/user/-/activities/heart/date/2026-10-01/1d/1min.json'  # any API path
+fitbit-cli auth        # prints a URL (and opens it in your browser if it can)
+                       # → sign in + approve → the localhost redirect fails
+                       # (expected) → copy the full URL → paste it back
+
+fitbit-cli status      # account, token freshness, tracker battery
+fitbit-cli pull today  # live data immediately
 ```
 
-Shortcuts: `profile devices badges today steps hr hr-summary sleep weight temp friends goals`.
+## `pull` — live data
+
+```sh
+fitbit-cli pull                    # prints every shortcut
+fitbit-cli pull today              # steps / calories / active minutes
+fitbit-cli pull sleep              # last night
+fitbit-cli pull sleep 2026-10-05   # any date
+fitbit-cli pull hr --out hr.json   # save raw JSON to a file
+fitbit-cli pull '1/user/-/activities/heart/date/2026-10-01/1d/1min.json'
+```
+
+Shortcuts: `profile devices badges today summary steps distance floors
+calories azm hr hr-summary sleep sleep-goal weight fat temp vo2 breathing
+spo2 hrv water food friends leaderboard goals activities alarms`
+
+Rate limit: ~150 requests/hour shared with the Fitbit app. A `429` means wait
+a few minutes — it's the app's own quota, nothing's broken.
 
 ## As an MCP server (for agents)
 
 ```sh
-fitbit-cli mcp     # stdio JSON-RPC: tools = pull, list_pulls, status
+fitbit-cli mcp    # stdio JSON-RPC — tools: pull, list_pulls, status
 ```
 
-Claude Desktop / Devin / Everett config:
+Claude Desktop / Devin / Everett / Codex config:
 
 ```json
 "fitbit": {"command": "fitbit-cli", "args": ["mcp"]}
 ```
 
-## How auth works
+## How auth works (and why nothing expires)
 
-PKCE + public client_id (`22C4DT`), same as the official apps — you approve in
-the browser, the redirect to `localhost:8080` fails (expected), you paste the
-URL back. Tokens land in `~/.fitbit-export/tokens-{userId}.json` and refresh
+PKCE + the public client_id Fitbit's own tooling uses — you approve once in a
+browser, the redirect to `localhost:8080` fails (expected), you paste the URL
+back. Tokens land in `~/.fitbit-export/tokens-{userId}.json` and refresh
 automatically on `android-api.fitbit.com/oauth2/token` — no client secret, no
-Cloud project, nothing expires as long as you keep pulling.
+Google Cloud consent screen (that's where the 7-day expiry people hit comes
+from — this path doesn't have it).
 
-Only reads your own account. ~150 requests/hour quota shared with the Fitbit app.
+Only reads your own account, only endpoints the app itself uses.

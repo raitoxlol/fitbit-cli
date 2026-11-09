@@ -1,10 +1,18 @@
 //! fitbit-cli — pull your own Fitbit data, live, anytime.
 //!
-//! Uses the same public OAuth client_id Fitbit's own tooling uses, against the
-//! private app API (android-api.fitbit.com) — the backend the real Fitbit app
-//! talks to, which outlives the legacy api.fitbit.com shutdown. One OAuth
-//! approval, then tokens self-rotate forever — no Google Cloud project, no
-//! 7-day credential expiry.
+//! Talks to `web-api.fitbit.com` — the backend that serves Fitbit's own web
+//! app — using that web app's public PKCE client (228TQD). One OAuth approval,
+//! then tokens self-rotate forever.
+//!
+//! Why this host: on 2026-10-30 Google decommissioned the developer endpoints.
+//! `api.fitbit.com/oauth2/token` and `android-api.fitbit.com/oauth2/token` now
+//! answer 410 Gone for every client, and client 22C4DT is hard-blocked. But
+//! Fitbit's first-party web app still logs in and still reads its own data:
+//! `web-api.fitbit.com/oauth2/token` is live, accepts 228TQD as a public PKCE
+//! client (no secret), and `web-api.fitbit.com/1/user/-/...` still speaks the
+//! legacy JSON the shortcuts here use. Login is delegated to Google through
+//! `www.fitbit.com/login/transferpage`, so there is still no Google Cloud
+//! project, no API allowlist, and no googlehealth.* scopes involved.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -17,10 +25,22 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const API: &str = "https://android-api.fitbit.com";
+const API: &str = "https://web-api.fitbit.com";
 const AUTHORIZE: &str = "https://www.fitbit.com/oauth2/authorize";
 const REDIRECT: &str = "http://localhost:8080/callback";
-const CLIENT_ID: &str = "22C4DT";
+
+/// The redirect must be byte-identical between authorize and token exchange.
+/// Default is a loopback URL that fails to load (so the code stays in the URL
+/// bar, easy to paste). Override if the login step rejects it:
+/// `FITBIT_REDIRECT=https://www.fitbit.com/dashboard fitbit-cli auth`.
+fn redirect_uri() -> String {
+    std::env::var("FITBIT_REDIRECT").unwrap_or_else(|_| REDIRECT.to_string())
+}
+
+/// Fitbit's own web-app client. Public + PKCE: the token endpoint accepts
+/// authorization_code and refresh_token grants without a client secret.
+/// (22C4DT, the old tooling client, is decommissioned — 410 Gone.)
+const CLIENT_ID: &str = "228TQD";
 const SCOPES: &str = "activity heartrate location nutrition oxygen_saturation \
                       profile respiratory_rate settings sleep social temperature weight";
 
@@ -136,6 +156,20 @@ fn refresh_tokens(path: &Path, t: &mut Tokens) -> Result<()> {
             ("client_id", CLIENT_ID),
         ],
     )
+    .map_err(|e| {
+        let msg = e.to_string();
+        if msg.contains("410") {
+            anyhow::anyhow!(
+                "{msg}\n\nthis endpoint is decommissioned — run `fitbit-cli auth` to re-authorize"
+            )
+        } else if msg.contains("invalid_grant") {
+            anyhow::anyhow!(
+                "{msg}\n\nthe refresh token is dead or belongs to another client — run `fitbit-cli auth`"
+            )
+        } else {
+            e
+        }
+    })
     .context("refresh rejected")?;
     t.access_token = resp["access_token"]
         .as_str()
@@ -182,7 +216,7 @@ fn checked_url(target: &str) -> Result<String> {
 fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
     let (tp, mut t) = load_tokens(user)?;
     if t.token_expires_at < now() + 60 {
-        eprintln!("token expiring — refreshing via android-api…");
+        eprintln!("token expiring — refreshing via web-api…");
         refresh_tokens(&tp, &mut t)?;
     }
     let (status, body) = api_get(path, &t.access_token)?;
@@ -193,37 +227,53 @@ fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
     Ok((status, body))
 }
 
-fn cmd_auth() -> Result<()> {
+fn cmd_auth(no_open: bool) -> Result<()> {
     let verifier = random_b64(64)?;
     let challenge = {
         let mut h = Sha256::new();
         h.update(verifier.as_bytes());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
     };
+    let redirect = redirect_uri();
     let state = url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect::<String>();
     let url = format!(
         "{AUTHORIZE}?client_id={CLIENT_ID}&redirect_uri={}&response_type=code&state={state}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
-        url::form_urlencoded::byte_serialize(REDIRECT.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(redirect.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
     );
     println!("Open this URL in any browser to authorize:\n{url}\n");
-    if try_open_browser(&url) {
+    if !no_open && try_open_browser(&url) {
         eprintln!("(opened in your default browser)");
     }
-    print!("After approving, the browser lands on a localhost:8080 URL that fails to\nload — copy the full URL and paste it here: ");
+    print!("Sign in with the Google account your Fitbit data lives on, then approve.\nThe browser lands on a localhost:8080 URL that fails to load (expected) —\npaste that full URL back here (or just the `code` value): ");
     std::io::stdout().flush()?;
     let mut pasted = String::new();
     std::io::stdin().lock().read_line(&mut pasted)?;
     let pasted = pasted.trim();
-    let q = url::Url::parse(pasted)
+    let q: std::collections::HashMap<String, String> = url::Url::parse(pasted)
         .ok()
-        .and_then(|u| u.query_pairs().into_owned().collect::<std::collections::HashMap<_, _>>().into());
-    let q: std::collections::HashMap<String, String> = q.unwrap_or_default();
-    let code = q.get("code").cloned().unwrap_or_default();
+        .filter(|u| u.query_pairs().next().is_some())
+        .map(|u| u.query_pairs().into_owned().collect())
+        .unwrap_or_default();
+    // Accept a bare authorization code too — people copy that out of the URL bar
+    // or from a "this site can't be reached" page.
+    let code = q
+        .get("code")
+        .cloned()
+        .filter(|c| !c.is_empty())
+        .or_else(|| {
+            let bare = pasted.trim_matches(|c: char| c == '?' || c == '&');
+            (!bare.is_empty()
+                && !bare.contains(char::is_whitespace)
+                && !bare.contains('/')
+                && !bare.contains('='))
+            .then(|| bare.to_string())
+        })
+        .unwrap_or_default();
     if code.is_empty() {
         bail!("no 'code' param in that URL");
     }
-    if q.get("state").map(String::as_str) != Some(state.as_str()) {
+    if !q.is_empty() && q.get("state").map(String::as_str) != Some(state.as_str()) {
         bail!("state mismatch — wrong URL?");
     }
 
@@ -232,7 +282,7 @@ fn cmd_auth() -> Result<()> {
         &[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", REDIRECT),
+            ("redirect_uri", redirect.as_str()),
             ("client_id", CLIENT_ID),
             ("code_verifier", verifier.as_str()),
         ],
@@ -588,7 +638,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// One-time OAuth (approve in browser, paste back the URL)
-    Auth,
+    Auth {
+        /// Print the URL but don't hand it to the OS browser
+        #[arg(long)]
+        no_open: bool,
+    },
     /// Live pull: `fitbit-cli pull today` or a raw API path
     Pull {
         /// Shortcut name or raw API path (omit to list shortcuts)
@@ -615,7 +669,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Auth => cmd_auth(),
+        Cmd::Auth { no_open } => cmd_auth(no_open),
         Cmd::Pull { path, date, out, user } => cmd_pull(path.as_deref(), date, out, user),
         Cmd::Status { user } => cmd_status(user),
         Cmd::Mcp => mcp_serve(),

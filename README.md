@@ -1,14 +1,31 @@
 # fitbit-cli
 
-Pull your own Fitbit data, live, anytime — one small Rust binary, no Google
-Cloud project, no expiring credentials.
+Read your own Fitbit data with one Rust binary. Sign in through Fitbit's
+first-party Google login, then use the CLI or its stdio MCP server.
 
-It talks to `android-api.fitbit.com` — the private backend the real Fitbit app
-uses — with the same public OAuth client Fitbit's own tooling uses. One browser
-approval, then tokens self-rotate forever. That host outlives the legacy
-`api.fitbit.com` shutdown (Oct 30, 2026).
+## Connection
+
+The CLI opens `https://fitbit.google.com/auth/signin` with a PKCE challenge.
+After Google sign-in, Fitbit returns a code in the fragment of
+`https://accounts.fitbit.com/clienthandler`. The CLI exchanges that code at
+`web-api.fitbit.com/oauth2/token` with client `228TQF` and the same verifier.
+
+The developer `/oauth2/authorize` route rejects this return address. It is a
+different flow from the one Fitbit's current web app uses.
+
+On November 9, 2026, the first-party handoff, token exchange, profile/activity/
+sleep/device reads, and automatic token refresh passed against one account.
+This uses Fitbit's private web API, so future app changes can break the flow.
 
 ## Install
+
+This login fix requires a source install until a release includes it:
+
+```sh
+cargo install --git https://github.com/raitoxlol/fitbit-cli --force
+```
+
+For tagged releases:
 
 ```sh
 # prebuilt binary — grab the latest release for your platform:
@@ -23,16 +40,32 @@ cargo install --git https://github.com/raitoxlol/fitbit-cli
 Binaries are published for macOS (Apple Silicon + Intel), Linux x86_64, and
 Windows on every `v*` tag.
 
-## Quickstart (60 seconds)
+## Quickstart
 
 ```sh
-fitbit-cli auth        # prints a URL (and opens it in your browser if it can)
-                       # → sign in + approve → the localhost redirect fails
-                       # (expected) → copy the full URL → paste it back
-
+fitbit-cli auth        # opens Fitbit's Google sign-in
+                       # sign in, then paste the full return URL into the prompt
 fitbit-cli status      # account, token freshness, tracker battery
-fitbit-cli pull today  # live data immediately
+fitbit-cli pull today  # activity data
 ```
+
+Use the Google account linked to your Fitbit profile. No developer app, client
+secret, or personal configuration is required. Each sign-in saves that account
+separately. Accounts that cannot use Fitbit's Google sign-in are not verified.
+
+A blank Fitbit Accounts page after sign-in is expected. Its address contains
+`#code=...`. Treat that URL as a temporary credential.
+
+Agents can separate link generation from completion:
+
+```sh
+fitbit-cli auth --non-interactive
+fitbit-cli auth --complete '<return URL or code>'
+```
+
+The pending file stores the PKCE verifier and the client used for completion.
+Tokens retain that client for API requests and refresh. Existing token files
+without a client ID retain their previous `228TQD` default until reauthorization.
 
 ## `pull` — live data
 
@@ -73,13 +106,11 @@ Claude Desktop / Devin / Everett / Codex config:
 "fitbit": {"command": "fitbit-cli", "args": ["mcp"]}
 ```
 
-## How auth works (and why nothing expires)
+## Token refresh
 
-PKCE + the public client_id Fitbit's own tooling uses — you approve once in a
-browser, the redirect to `localhost:8080` fails (expected), you paste the URL
-back. Tokens land in `~/.fitbit-export/tokens-{userId}.json` and refresh
-automatically on `android-api.fitbit.com/oauth2/token` — no client secret, no
-Google Cloud consent screen (that's where the 7-day expiry people hit comes
-from — this path doesn't have it).
+Tokens are saved in `~/.fitbit-export/tokens-{userId}.json`. The CLI refreshes
+before expiry and retries once after an HTTP 401 response. Refresh tokens can
+be revoked or rejected. If refresh returns `invalid_grant`, run `fitbit-cli auth`
+to sign in again.
 
-Only reads your own account, only endpoints the app itself uses.
+The CLI reads the signed-in account through the endpoints Fitbit's app uses.

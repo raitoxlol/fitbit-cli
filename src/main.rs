@@ -227,53 +227,60 @@ fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
     Ok((status, body))
 }
 
-fn cmd_auth(no_open: bool) -> Result<()> {
-    let verifier = random_b64(64)?;
-    let challenge = {
-        let mut h = Sha256::new();
-        h.update(verifier.as_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
-    };
-    let redirect = redirect_uri();
-    let state = url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect::<String>();
-    let url = format!(
-        "{AUTHORIZE}?client_id={CLIENT_ID}&redirect_uri={}&response_type=code&state={state}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
-        url::form_urlencoded::byte_serialize(redirect.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
-    );
-    println!("Open this URL in any browser to authorize:\n{url}\n");
-    if !no_open && try_open_browser(&url) {
-        eprintln!("(opened in your default browser)");
-    }
-    print!("Sign in with the Google account your Fitbit data lives on, then approve.\nThe browser lands on a localhost:8080 URL that fails to load (expected) —\npaste that full URL back here (or just the `code` value): ");
-    std::io::stdout().flush()?;
-    let mut pasted = String::new();
-    std::io::stdin().lock().read_line(&mut pasted)?;
-    let pasted = pasted.trim();
-    let q: std::collections::HashMap<String, String> = url::Url::parse(pasted)
+/// PKCE state for a `--non-interactive` auth that hasn't been completed yet.
+#[derive(Serialize, Deserialize)]
+struct PendingAuth {
+    verifier: String,
+    state: String,
+    redirect: String,
+}
+
+fn pending_path() -> Result<PathBuf> {
+    Ok(tokens_dir()?.join(".pending-auth.json"))
+}
+
+fn load_pending() -> Result<PendingAuth> {
+    let p = pending_path()?;
+    let raw = fs::read_to_string(&p).with_context(|| {
+        format!(
+            "no pending auth at {} — run `fitbit-cli auth --non-interactive` first",
+            p.display()
+        )
+    })?;
+    serde_json::from_str(&raw).context("bad pending-auth file")
+}
+
+/// Pull the query params out of a pasted redirect URL.
+fn extract_query(pasted: &str) -> std::collections::HashMap<String, String> {
+    url::Url::parse(pasted)
         .ok()
         .filter(|u| u.query_pairs().next().is_some())
         .map(|u| u.query_pairs().into_owned().collect())
-        .unwrap_or_default();
-    // Accept a bare authorization code too — people copy that out of the URL bar
-    // or from a "this site can't be reached" page.
+        .unwrap_or_default()
+}
+
+/// A code pasted bare, with no URL around it.
+fn bare_code(pasted: &str) -> Option<String> {
+    let bare = pasted.trim_matches(|c: char| c == '?' || c == '&');
+    (!bare.is_empty()
+        && !bare.contains(char::is_whitespace)
+        && !bare.contains('/')
+        && !bare.contains('='))
+    .then(|| bare.to_string())
+}
+
+fn finish_auth(pasted: &str, pending: &PendingAuth) -> Result<()> {
+    let q = extract_query(pasted);
     let code = q
         .get("code")
         .cloned()
         .filter(|c| !c.is_empty())
-        .or_else(|| {
-            let bare = pasted.trim_matches(|c: char| c == '?' || c == '&');
-            (!bare.is_empty()
-                && !bare.contains(char::is_whitespace)
-                && !bare.contains('/')
-                && !bare.contains('='))
-            .then(|| bare.to_string())
-        })
+        .or_else(|| bare_code(pasted))
         .unwrap_or_default();
     if code.is_empty() {
         bail!("no 'code' param in that URL");
     }
-    if !q.is_empty() && q.get("state").map(String::as_str) != Some(state.as_str()) {
+    if !q.is_empty() && q.get("state").map(String::as_str) != Some(pending.state.as_str()) {
         bail!("state mismatch — wrong URL?");
     }
 
@@ -282,9 +289,9 @@ fn cmd_auth(no_open: bool) -> Result<()> {
         &[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", redirect.as_str()),
+            ("redirect_uri", pending.redirect.as_str()),
             ("client_id", CLIENT_ID),
-            ("code_verifier", verifier.as_str()),
+            ("code_verifier", pending.verifier.as_str()),
         ],
     )
     .context("token exchange failed")?;
@@ -313,9 +320,62 @@ fn cmd_auth(no_open: bool) -> Result<()> {
     set_private_perms(&dir, 0o700);
     let p = dir.join(format!("tokens-{}.json", t.user_id));
     save_tokens(&p, &t)?;
+    let _ = fs::remove_file(pending_path()?);
     println!("\nSaved {}\nAuthorized: {} ({})", p.display(), t.display_name, t.user_id);
     println!("Now: `fitbit-cli pull today` — or `fitbit-cli mcp` for agents.");
     Ok(())
+}
+
+fn authorize_url(pending: &PendingAuth) -> String {
+    let challenge = {
+        let mut h = Sha256::new();
+        h.update(pending.verifier.as_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
+    };
+    format!(
+        "{AUTHORIZE}?client_id={CLIENT_ID}&redirect_uri={}&response_type=code&state={}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
+        url::form_urlencoded::byte_serialize(pending.redirect.as_bytes()).collect::<String>(),
+        pending.state,
+        url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
+    )
+}
+
+fn cmd_auth(args: AuthArgs) -> Result<()> {
+    if let Some(pasted) = args.complete.as_deref() {
+        let pending = load_pending()?;
+        return finish_auth(pasted, &pending);
+    }
+
+    let pending = PendingAuth {
+        verifier: random_b64(64)?,
+        state: url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect::<String>(),
+        redirect: redirect_uri(),
+    };
+    let url = authorize_url(&pending);
+
+    if args.non_interactive {
+        let dir = tokens_dir()?;
+        fs::create_dir_all(&dir)?;
+        set_private_perms(&dir, 0o700);
+        let p = pending_path()?;
+        fs::write(&p, serde_json::to_string_pretty(&pending)?)?;
+        set_private_perms(&p, 0o600);
+        println!("{url}");
+        eprintln!(
+            "\nOpen that URL, approve, then finish with:\n  fitbit-cli auth --complete '<redirected URL or code>'"
+        );
+        return Ok(());
+    }
+
+    println!("Open this URL in any browser to authorize:\n{url}\n");
+    if !args.no_open && try_open_browser(&url) {
+        eprintln!("(opened in your default browser)");
+    }
+    print!("Sign in with the Google account your Fitbit data lives on, then approve.\nThe browser lands on a localhost:8080 URL that fails to load (expected) —\npaste that full URL back here (or just the `code` value): ");
+    std::io::stdout().flush()?;
+    let mut pasted = String::new();
+    std::io::stdin().lock().read_line(&mut pasted)?;
+    finish_auth(pasted.trim(), &pending)
 }
 
 /// Best-effort browser open; false if the platform opener failed.
@@ -635,14 +695,23 @@ struct Cli {
     cmd: Cmd,
 }
 
+#[derive(clap::Args)]
+struct AuthArgs {
+    /// Print the URL but don't hand it to the OS browser
+    #[arg(long)]
+    no_open: bool,
+    /// Print the URL and save pending state, then exit (finish with --complete)
+    #[arg(long)]
+    non_interactive: bool,
+    /// Finish a --non-interactive auth: the redirected URL, or just the code
+    #[arg(long, value_name = "CODE_OR_URL")]
+    complete: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// One-time OAuth (approve in browser, paste back the URL)
-    Auth {
-        /// Print the URL but don't hand it to the OS browser
-        #[arg(long)]
-        no_open: bool,
-    },
+    Auth(AuthArgs),
     /// Live pull: `fitbit-cli pull today` or a raw API path
     Pull {
         /// Shortcut name or raw API path (omit to list shortcuts)
@@ -669,7 +738,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Auth { no_open } => cmd_auth(no_open),
+        Cmd::Auth(args) => cmd_auth(args),
         Cmd::Pull { path, date, out, user } => cmd_pull(path.as_deref(), date, out, user),
         Cmd::Status { user } => cmd_status(user),
         Cmd::Mcp => mcp_serve(),

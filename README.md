@@ -55,6 +55,13 @@ fitbit-cli status      # account, token freshness, tracker battery
 fitbit-cli pull today  # live data immediately
 ```
 
+Headless / agent-driven (two steps, no prompt):
+
+```sh
+fitbit-cli auth --non-interactive        # prints the URL, saves PKCE state
+fitbit-cli auth --complete '<url or code>'   # exchanges it, saves tokens
+```
+
 ## `pull` — live data
 
 ```sh

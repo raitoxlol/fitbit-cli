@@ -1,18 +1,6 @@
-//! fitbit-cli — pull your own Fitbit data, live, anytime.
-//!
-//! Talks to `web-api.fitbit.com` — the backend that serves Fitbit's own web
-//! app — using that web app's public PKCE client (228TQD). One OAuth approval,
-//! then tokens self-rotate forever.
-//!
-//! Why this host: on 2026-10-30 Google decommissioned the developer endpoints.
-//! `api.fitbit.com/oauth2/token` and `android-api.fitbit.com/oauth2/token` now
-//! answer 410 Gone for every client, and client 22C4DT is hard-blocked. But
-//! Fitbit's first-party web app still logs in and still reads its own data:
-//! `web-api.fitbit.com/oauth2/token` is live, accepts 228TQD as a public PKCE
-//! client (no secret), and `web-api.fitbit.com/1/user/-/...` still speaks the
-//! legacy JSON the shortcuts here use. Login is delegated to Google through
-//! `www.fitbit.com/login/transferpage`, so there is still no Google Cloud
-//! project, no API allowlist, and no googlehealth.* scopes involved.
+//! Read your own Fitbit data through its first-party web sign-in and API.
+//! Google sign-in returns a PKCE-bound code to accounts.fitbit.com/clienthandler.
+//! Exchange and refresh use web-api.fitbit.com with client 228TQF.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -26,26 +14,18 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const API: &str = "https://web-api.fitbit.com";
-const AUTHORIZE: &str = "https://www.fitbit.com/oauth2/authorize";
-const REDIRECT: &str = "http://localhost:8080/callback";
+const AUTHORIZE: &str = "https://fitbit.google.com/auth/signin";
+const REDIRECT: &str = "https://accounts.fitbit.com/clienthandler";
+const CLIENT_ID: &str = "228TQF";
 
-/// The redirect must be byte-identical between authorize and token exchange.
-/// Default is a loopback URL that fails to load (so the code stays in the URL
-/// bar, easy to paste). Override if the login step rejects it:
-/// `FITBIT_REDIRECT=https://www.fitbit.com/dashboard fitbit-cli auth`.
-fn redirect_uri() -> String {
-    std::env::var("FITBIT_REDIRECT").unwrap_or_else(|_| REDIRECT.to_string())
+fn legacy_client_id() -> String {
+    "228TQD".to_string()
 }
-
-/// Fitbit's own web-app client. Public + PKCE: the token endpoint accepts
-/// authorization_code and refresh_token grants without a client secret.
-/// (22C4DT, the old tooling client, is decommissioned — 410 Gone.)
-const CLIENT_ID: &str = "228TQD";
-const SCOPES: &str = "activity heartrate location nutrition oxygen_saturation \
-                      profile respiratory_rate settings sleep social temperature weight";
 
 #[derive(Serialize, Deserialize)]
 struct Tokens {
+    #[serde(default = "legacy_client_id")]
+    client_id: String,
     access_token: String,
     refresh_token: String,
     token_expires_at: i64,
@@ -153,7 +133,7 @@ fn refresh_tokens(path: &Path, t: &mut Tokens) -> Result<()> {
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", t.refresh_token.as_str()),
-            ("client_id", CLIENT_ID),
+            ("client_id", t.client_id.as_str()),
         ],
     )
     .map_err(|e| {
@@ -184,13 +164,13 @@ fn refresh_tokens(path: &Path, t: &mut Tokens) -> Result<()> {
     save_tokens(path, t)
 }
 
-fn api_get(url_or_path: &str, access: &str) -> Result<(u16, String)> {
+fn api_get(url_or_path: &str, access: &str, client_id: &str) -> Result<(u16, String)> {
     let url = checked_url(url_or_path)?;
     let resp = client()?
         .get(&url)
         .header("Authorization", format!("Bearer {access}"))
         .header("Accept-Language", "en_US")
-        .header("fitbit-client-id", CLIENT_ID)
+        .header("fitbit-client-id", client_id)
         .send()?;
     let status = resp.status().as_u16();
     Ok((status, resp.text()?))
@@ -219,17 +199,28 @@ fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
         eprintln!("token expiring — refreshing via web-api…");
         refresh_tokens(&tp, &mut t)?;
     }
-    let (status, body) = api_get(path, &t.access_token)?;
+    let (status, body) = api_get(path, &t.access_token, &t.client_id)?;
     if status == 401 {
         refresh_tokens(&tp, &mut t)?;
-        return api_get(path, &t.access_token);
+        return api_get(path, &t.access_token, &t.client_id);
     }
     Ok((status, body))
 }
 
-/// PKCE state for a `--non-interactive` auth that hasn't been completed yet.
+#[derive(Default, Serialize, Deserialize, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum AuthFlow {
+    #[default]
+    LegacyOAuth,
+    GoogleWeb,
+}
+
 #[derive(Serialize, Deserialize)]
 struct PendingAuth {
+    #[serde(default)]
+    flow: AuthFlow,
+    #[serde(default = "legacy_client_id")]
+    client_id: String,
     verifier: String,
     state: String,
     redirect: String,
@@ -269,20 +260,34 @@ fn bare_code(pasted: &str) -> Option<String> {
     .then(|| bare.to_string())
 }
 
+fn auth_code(pasted: &str, pending: &PendingAuth) -> Result<String> {
+    let pasted = pasted.trim();
+    if let Some(code) = bare_code(pasted) {
+        return Ok(code);
+    }
+    let parsed = url::Url::parse(pasted).context("paste the full return URL or authorization code")?;
+    let redirect = url::Url::parse(&pending.redirect)?;
+    if parsed.origin() != redirect.origin() || parsed.path() != redirect.path() {
+        bail!("return URL does not match the pending sign-in");
+    }
+    let params: std::collections::HashMap<String, String> = match pending.flow {
+        AuthFlow::GoogleWeb => url::form_urlencoded::parse(
+            parsed.fragment().unwrap_or_default().as_bytes()
+        ).into_owned().collect(),
+        AuthFlow::LegacyOAuth => {
+            let q = extract_query(pasted);
+            if q.get("state").map(String::as_str) != Some(pending.state.as_str()) {
+                bail!("state mismatch: return URL belongs to another sign-in");
+            }
+            q
+        }
+    };
+    params.get("code").filter(|c| !c.is_empty()).cloned()
+        .context("no authorization code in that URL")
+}
+
 fn finish_auth(pasted: &str, pending: &PendingAuth) -> Result<()> {
-    let q = extract_query(pasted);
-    let code = q
-        .get("code")
-        .cloned()
-        .filter(|c| !c.is_empty())
-        .or_else(|| bare_code(pasted))
-        .unwrap_or_default();
-    if code.is_empty() {
-        bail!("no 'code' param in that URL");
-    }
-    if !q.is_empty() && q.get("state").map(String::as_str) != Some(pending.state.as_str()) {
-        bail!("state mismatch — wrong URL?");
-    }
+    let code = auth_code(pasted, pending)?;
 
     let td = post_form(
         &format!("{API}/oauth2/token"),
@@ -290,7 +295,7 @@ fn finish_auth(pasted: &str, pending: &PendingAuth) -> Result<()> {
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
             ("redirect_uri", pending.redirect.as_str()),
-            ("client_id", CLIENT_ID),
+            ("client_id", pending.client_id.as_str()),
             ("code_verifier", pending.verifier.as_str()),
         ],
     )
@@ -300,12 +305,13 @@ fn finish_auth(pasted: &str, pending: &PendingAuth) -> Result<()> {
         .as_str()
         .context("token response missing access_token")?
         .to_string();
-    let (st, body) = api_get("1/user/-/profile.json", &access)?;
+    let (st, body) = api_get("1/user/-/profile.json", &access, &pending.client_id)?;
     if st != 200 {
         bail!("profile fetch failed ({st}): {body}");
     }
     let user = &serde_json::from_str::<Value>(&body)?["user"];
     let t = Tokens {
+        client_id: pending.client_id.clone(),
         access_token: access,
         refresh_token: td["refresh_token"]
             .as_str()
@@ -332,12 +338,11 @@ fn authorize_url(pending: &PendingAuth) -> String {
         h.update(pending.verifier.as_bytes());
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
     };
-    format!(
-        "{AUTHORIZE}?client_id={CLIENT_ID}&redirect_uri={}&response_type=code&state={}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
-        url::form_urlencoded::byte_serialize(pending.redirect.as_bytes()).collect::<String>(),
-        pending.state,
-        url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
-    )
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("redirect_url", &pending.redirect)
+        .append_pair("code_challenge", &challenge)
+        .finish();
+    format!("{AUTHORIZE}?{query}")
 }
 
 fn cmd_auth(args: AuthArgs) -> Result<()> {
@@ -347,9 +352,11 @@ fn cmd_auth(args: AuthArgs) -> Result<()> {
     }
 
     let pending = PendingAuth {
+        flow: AuthFlow::GoogleWeb,
+        client_id: CLIENT_ID.to_string(),
         verifier: random_b64(64)?,
-        state: url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect::<String>(),
-        redirect: redirect_uri(),
+        state: String::new(),
+        redirect: REDIRECT.to_string(),
     };
     let url = authorize_url(&pending);
 
@@ -371,7 +378,7 @@ fn cmd_auth(args: AuthArgs) -> Result<()> {
     if !args.no_open && try_open_browser(&url) {
         eprintln!("(opened in your default browser)");
     }
-    print!("Sign in with the Google account your Fitbit data lives on, then approve.\nThe browser lands on a localhost:8080 URL that fails to load (expected) —\npaste that full URL back here (or just the `code` value): ");
+    print!("Sign in with the Google account your Fitbit data lives on, then approve.\nThe browser may show a blank Fitbit Accounts page.\nPaste its full URL here (or just the `code` value): ");
     std::io::stdout().flush()?;
     let mut pasted = String::new();
     std::io::stdin().lock().read_line(&mut pasted)?;
@@ -742,5 +749,72 @@ fn main() -> Result<()> {
         Cmd::Pull { path, date, out, user } => cmd_pull(path.as_deref(), date, out, user),
         Cmd::Status { user } => cmd_status(user),
         Cmd::Mcp => mcp_serve(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending() -> PendingAuth {
+        PendingAuth {
+            flow: AuthFlow::GoogleWeb,
+            client_id: CLIENT_ID.into(),
+            verifier: "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk".into(),
+            state: String::new(),
+            redirect: REDIRECT.into(),
+        }
+    }
+
+    #[test]
+    fn saved_auth_uses_google_handoff_and_pkce() {
+        let pending = pending();
+        let restored: PendingAuth =
+            serde_json::from_str(&serde_json::to_string(&pending).unwrap()).unwrap();
+        assert_eq!(restored.flow, AuthFlow::GoogleWeb);
+        assert_eq!(restored.client_id, CLIENT_ID);
+        let link = authorize_url(&restored);
+        assert!(link.starts_with("https://fitbit.google.com/auth/signin?"));
+        let query = extract_query(&link);
+        assert_eq!(query["redirect_url"], REDIRECT);
+        assert_eq!(query["code_challenge"], "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+        assert!(!query.contains_key("redirect_uri"));
+    }
+
+    #[test]
+    fn google_return_reads_fragment_even_with_target_query() {
+        let url = format!("{REDIRECT}?targetUrl=https%3A%2F%2Fwww.fitbit.com%2Fsettings#code=test-code");
+        assert_eq!(auth_code(&url, &pending()).unwrap(), "test-code");
+        assert_eq!(auth_code(" test-code ", &pending()).unwrap(), "test-code");
+        assert!(auth_code(&format!("{REDIRECT}#code="), &pending()).is_err());
+        assert!(auth_code(&format!("{REDIRECT}?code=query-code"), &pending()).is_err());
+        assert!(auth_code("https://example.com/clienthandler#code=test", &pending()).is_err());
+        assert!(auth_code("https://accounts.fitbit.com/other#code=test", &pending()).is_err());
+    }
+
+    #[test]
+    fn legacy_pending_retains_client_and_state_check() {
+        let old: PendingAuth = serde_json::from_value(json!({
+            "verifier": "test", "state": "expected", "redirect": "http://localhost:8080/callback"
+        })).unwrap();
+        assert_eq!(old.client_id, "228TQD");
+        assert_eq!(old.flow, AuthFlow::LegacyOAuth);
+        assert_eq!(auth_code("http://localhost:8080/callback?code=test&state=expected", &old).unwrap(), "test");
+        assert!(auth_code("http://localhost:8080/callback?code=test&state=wrong", &old).is_err());
+        assert!(auth_code("http://localhost:8080/callback?code=test", &old).is_err());
+    }
+
+    #[test]
+    fn tokens_preserve_their_client_across_serialization() {
+        let mut saved = json!({
+            "access_token": "dummy", "refresh_token": "dummy",
+            "token_expires_at": 0, "user_id": "test", "display_name": "test"
+        });
+        let legacy: Tokens = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(legacy.client_id, "228TQD");
+        saved["client_id"] = json!(CLIENT_ID);
+        let chosen: Tokens = serde_json::from_value(saved).unwrap();
+        let restored: Tokens = serde_json::from_str(&serde_json::to_string(&chosen).unwrap()).unwrap();
+        assert_eq!(restored.client_id, CLIENT_ID);
     }
 }

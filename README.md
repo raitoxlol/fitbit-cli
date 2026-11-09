@@ -1,32 +1,21 @@
 # fitbit-cli
 
-Pull your own Fitbit data, live, anytime — one small Rust binary, no Google
-Cloud project, no expiring credentials.
+Read your own Fitbit data with one Rust binary. Sign in through Fitbit's
+first-party Google login, then use the CLI or its stdio MCP server.
 
-It talks to `web-api.fitbit.com` — the backend that serves Fitbit's own web
-app — with that app's public PKCE client. One browser approval, then tokens
-self-rotate forever. No Google Cloud project, no API allowlist, no
-`googlehealth.*` scopes, no expiring credentials.
+## Connection
 
-## Why this host
+The CLI opens `https://fitbit.google.com/auth/signin` with a PKCE challenge.
+After Google sign-in, Fitbit returns a code in the fragment of
+`https://accounts.fitbit.com/clienthandler`. The CLI exchanges that code at
+`web-api.fitbit.com/oauth2/token` with client `228TQF` and the same verifier.
 
-On **2026-10-30** Google decommissioned the developer endpoints. Verified
-against the live service:
+The developer `/oauth2/authorize` route rejects this return address. It is a
+different flow from the one Fitbit's current web app uses.
 
-| endpoint | status |
-|---|---|
-| `api.fitbit.com/oauth2/token` | `410 Gone` for every client |
-| `android-api.fitbit.com/oauth2/token` | `410 Gone` for every client |
-| client `22C4DT` (old tooling client) | hard-blocked, `410` |
-| `web-api.fitbit.com/oauth2/token` | **live** — accepts `228TQD` |
-| `web-api.fitbit.com/1/user/-/…` | **live** — legacy JSON intact |
-
-The web app's client `228TQD` is a public PKCE client: the token endpoint takes
-`authorization_code` and `refresh_token` grants with a `code_verifier` and no
-client secret. Sign-in is delegated to Google through
-`www.fitbit.com/login/transferpage`, so the account you approve with is your
-Google account — but this is Fitbit's own login, not a Cloud project you have to
-create or maintain.
+On November 9, 2026, the first-party handoff, token exchange, profile/activity/
+sleep/device reads, and automatic token refresh passed against one account.
+This uses Fitbit's private web API, so future app changes can break the flow.
 
 ## Install
 
@@ -43,24 +32,28 @@ cargo install --git https://github.com/raitoxlol/fitbit-cli
 Binaries are published for macOS (Apple Silicon + Intel), Linux x86_64, and
 Windows on every `v*` tag.
 
-## Quickstart (60 seconds)
+## Quickstart
 
 ```sh
-fitbit-cli auth        # prints a URL (and opens it in your browser if it can)
-                       # → sign in with Google + approve → the localhost:8080
-                       # redirect fails (expected) → paste the full URL or the
-                       # `code` value back
-
+fitbit-cli auth        # opens Fitbit's Google sign-in
+                       # sign in, then paste the full return URL into the prompt
 fitbit-cli status      # account, token freshness, tracker battery
-fitbit-cli pull today  # live data immediately
+fitbit-cli pull today  # activity data
 ```
 
-Headless / agent-driven (two steps, no prompt):
+A blank Fitbit Accounts page after sign-in is expected. Its address contains
+`#code=...`. Treat that URL as a temporary credential.
+
+Agents can separate link generation from completion:
 
 ```sh
-fitbit-cli auth --non-interactive        # prints the URL, saves PKCE state
-fitbit-cli auth --complete '<url or code>'   # exchanges it, saves tokens
+fitbit-cli auth --non-interactive
+fitbit-cli auth --complete '<return URL or code>'
 ```
+
+The pending file stores the PKCE verifier and the client used for completion.
+Tokens retain that client for API requests and refresh. Existing token files
+without a client ID retain their previous `228TQD` default until reauthorization.
 
 ## `pull` — live data
 
@@ -101,15 +94,11 @@ Claude Desktop / Devin / Everett / Codex config:
 "fitbit": {"command": "fitbit-cli", "args": ["mcp"]}
 ```
 
-## How auth works (and why nothing expires)
+## Token refresh
 
-PKCE against `web-api.fitbit.com` with client `228TQD` — you approve once in a
-browser, the redirect to `localhost:8080` fails (expected), you paste the URL or
-code back. Tokens land in `~/.fitbit-export/tokens-{userId}.json` and refresh
-automatically on `web-api.fitbit.com/oauth2/token` — no client secret, no Google
-Cloud project, no scope allowlist.
+Tokens are saved in `~/.fitbit-export/tokens-{userId}.json`. The CLI refreshes
+before expiry and retries once after an HTTP 401 response. Refresh tokens can
+be revoked or rejected. If refresh returns `invalid_grant`, run `fitbit-cli auth`
+to sign in again.
 
-Only reads your own account, only endpoints the app itself uses.
-
-If `pull` says `invalid_grant`, the stored refresh token belongs to the retired
-client — run `fitbit-cli auth` once and it's fixed for good.
+The CLI reads the signed-in account through the endpoints Fitbit's app uses.

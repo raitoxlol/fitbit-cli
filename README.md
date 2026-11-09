@@ -19,6 +19,14 @@ This uses Fitbit's private web API, so future app changes can break the flow.
 
 ## Install
 
+This login fix requires a source install until a release includes it:
+
+```sh
+cargo install --git https://github.com/raitoxlol/fitbit-cli --force
+```
+
+For tagged releases:
+
 ```sh
 # prebuilt binary — grab the latest release for your platform:
 # https://github.com/raitoxlol/fitbit-cli/releases/latest
@@ -40,6 +48,10 @@ fitbit-cli auth        # opens Fitbit's Google sign-in
 fitbit-cli status      # account, token freshness, tracker battery
 fitbit-cli pull today  # activity data
 ```
+
+Use the Google account linked to your Fitbit profile. No developer app, client
+secret, or personal configuration is required. Each sign-in saves that account
+separately. Accounts that cannot use Fitbit's Google sign-in are not verified.
 
 A blank Fitbit Accounts page after sign-in is expected. Its address contains
 `#code=...`. Treat that URL as a temporary credential.

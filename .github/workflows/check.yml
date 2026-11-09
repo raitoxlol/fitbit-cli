@@ -1,0 +1,31 @@
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - name: Verify CLI and MCP
+        if: runner.os != 'Windows'
+        run: python .agents/skills/verify-fitbit-cli/scripts/verify.py --binary target/debug/fitbit-cli
+      - name: Verify CLI and MCP (Windows)
+        if: runner.os == 'Windows'
+        run: python .agents/skills/verify-fitbit-cli/scripts/verify.py --binary target/debug/fitbit-cli.exe

@@ -1,10 +1,11 @@
 //! fitbit-cli — pull your own Fitbit data, live, anytime.
 //!
-//! Uses the same public OAuth client_id Fitbit's own tooling uses, against the
-//! private app API (android-api.fitbit.com) — the backend the real Fitbit app
-//! talks to, which outlives the legacy api.fitbit.com shutdown. One OAuth
-//! approval, then tokens self-rotate forever — no Google Cloud project, no
-//! 7-day credential expiry.
+//! Data reads go to the private app API (android-api.fitbit.com). Token
+//! exchange and refresh go to Fitbit's Web API token host
+//! (api.fitbit.com/oauth2/token). The old public Android client id is rejected
+//! there with HTTP 410; auth uses the client Fitbit's accounts site publishes,
+//! with PKCE. One OAuth approval, then tokens self-rotate — no Google Cloud
+//! project, no secret stored in this repo.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -18,11 +19,103 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const API: &str = "https://android-api.fitbit.com";
+/// Official Fitbit Web API token host. `android-api` returns HTTP 410 for
+/// token grants that still use the retired public client.
+const TOKEN_URL: &str = "https://api.fitbit.com/oauth2/token";
 const AUTHORIZE: &str = "https://www.fitbit.com/oauth2/authorize";
+/// Public accounts page whose config names the client the token host accepts.
+const ACCOUNTS_CONFIG: &str = "https://accounts.fitbit.com/";
 const REDIRECT: &str = "http://localhost:8080/callback";
-const CLIENT_ID: &str = "22C4DT";
+/// Sent on data reads only. Token grants must not use this id: Fitbit answers
+/// `client_id=22C4DT` with HTTP 410 on every token host.
+const DATA_CLIENT_ID: &str = "22C4DT";
 const SCOPES: &str = "activity heartrate location nutrition oxygen_saturation \
                       profile respiratory_rate settings sleep social temperature weight";
+
+/// Public OAuth client published on the Fitbit accounts page. `basic_token` is
+/// the opaque Basic credential from that page — never log it.
+struct OauthClient {
+    client_id: String,
+    basic_token: String,
+}
+
+fn oauth_client() -> Result<&'static OauthClient> {
+    static CACHE: std::sync::OnceLock<OauthClient> = std::sync::OnceLock::new();
+    if let Some(c) = CACHE.get() {
+        return Ok(c);
+    }
+    let c = fetch_oauth_client()?;
+    Ok(CACHE.get_or_init(|| c))
+}
+
+fn fetch_oauth_client() -> Result<OauthClient> {
+    let resp = client()?
+        .get(ACCOUNTS_CONFIG)
+        .send()
+        .context("failed to load Fitbit accounts config")?;
+    let status = resp.status();
+    let body = resp.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!("Fitbit accounts config HTTP {status}");
+    }
+    parse_oauth_client(&body).context("Fitbit accounts page has no public OAuth client")
+}
+
+/// Pull `clientId` and `basicToken` out of the accounts page config.
+/// The page percent-encodes a JSON blob; the client id sits next to basicToken.
+fn parse_oauth_client(page: &str) -> Result<OauthClient> {
+    let decoded = percent_decode(page);
+    let marker = "\"basicToken\":\"";
+    let pos = decoded
+        .find(marker)
+        .context("missing basicToken in accounts config")?;
+    let after = &decoded[pos + marker.len()..];
+    let end = after.find('"').context("unterminated basicToken")?;
+    let basic_token = &after[..end];
+    if basic_token.is_empty()
+        || !basic_token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-' | '_'))
+    {
+        bail!("unexpected basicToken encoding");
+    }
+    let look_start = pos.saturating_sub(800);
+    let client_id = json_string_last(&decoded[look_start..pos], "clientId")
+        .context("missing clientId next to basicToken")?;
+    if client_id.is_empty() || !client_id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        bail!("unexpected clientId");
+    }
+    Ok(OauthClient {
+        client_id,
+        basic_token: basic_token.to_string(),
+    })
+}
+
+fn json_string_last(hay: &str, field: &str) -> Option<String> {
+    let key = format!("\"{field}\":\"");
+    let rel = hay.rfind(&key)?;
+    let rest = &hay[rel + key.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
 
 #[derive(Serialize, Deserialize)]
 struct Tokens {
@@ -116,25 +209,35 @@ fn client() -> Result<reqwest::blocking::Client> {
         .context("failed to build HTTP client")
 }
 
-/// POST helper: on non-2xx, include the response body in the error.
-fn post_form(url: &str, form: &[(&str, &str)]) -> Result<Value> {
-    let resp = client()?.post(url).form(form).send().context("request failed")?;
+/// POST helper: on non-2xx, include a redacted response body in the error.
+fn post_form(url: &str, form: &[(&str, &str)], basic: Option<&str>) -> Result<Value> {
+    let mut req = client()?.post(url);
+    if let Some(b) = basic {
+        req = req.header("Authorization", format!("Basic {b}"));
+    }
+    let resp = req.form(form).send().context("request failed")?;
     let status = resp.status();
     let body = resp.text().unwrap_or_default();
     if !status.is_success() {
-        bail!("{status}: {}", body.chars().take(300).collect::<String>());
+        let mut msg: String = body.chars().take(300).collect();
+        if let Some(b) = basic {
+            msg = msg.replace(b, "[redacted]");
+        }
+        bail!("{status}: {msg}");
     }
     serde_json::from_str(&body).context("token endpoint returned non-JSON")
 }
 
 fn refresh_tokens(path: &Path, t: &mut Tokens) -> Result<()> {
+    let oauth = oauth_client()?;
     let resp = post_form(
-        &format!("{API}/oauth2/token"),
+        TOKEN_URL,
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", t.refresh_token.as_str()),
-            ("client_id", CLIENT_ID),
+            ("client_id", oauth.client_id.as_str()),
         ],
+        Some(oauth.basic_token.as_str()),
     )
     .context("refresh rejected")?;
     t.access_token = resp["access_token"]
@@ -156,7 +259,7 @@ fn api_get(url_or_path: &str, access: &str) -> Result<(u16, String)> {
         .get(&url)
         .header("Authorization", format!("Bearer {access}"))
         .header("Accept-Language", "en_US")
-        .header("fitbit-client-id", CLIENT_ID)
+        .header("fitbit-client-id", DATA_CLIENT_ID)
         .send()?;
     let status = resp.status().as_u16();
     Ok((status, resp.text()?))
@@ -182,7 +285,7 @@ fn checked_url(target: &str) -> Result<String> {
 fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
     let (tp, mut t) = load_tokens(user)?;
     if t.token_expires_at < now() + 60 {
-        eprintln!("token expiring — refreshing via android-api…");
+        eprintln!("token expiring — refreshing via api.fitbit.com…");
         refresh_tokens(&tp, &mut t)?;
     }
     let (status, body) = api_get(path, &t.access_token)?;
@@ -194,6 +297,7 @@ fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
 }
 
 fn cmd_auth() -> Result<()> {
+    let oauth = oauth_client()?;
     let verifier = random_b64(64)?;
     let challenge = {
         let mut h = Sha256::new();
@@ -202,7 +306,8 @@ fn cmd_auth() -> Result<()> {
     };
     let state = url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect::<String>();
     let url = format!(
-        "{AUTHORIZE}?client_id={CLIENT_ID}&redirect_uri={}&response_type=code&state={state}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
+        "{AUTHORIZE}?client_id={}&redirect_uri={}&response_type=code&state={state}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
+        oauth.client_id,
         url::form_urlencoded::byte_serialize(REDIRECT.as_bytes()).collect::<String>(),
         url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
     );
@@ -228,14 +333,15 @@ fn cmd_auth() -> Result<()> {
     }
 
     let td = post_form(
-        &format!("{API}/oauth2/token"),
+        TOKEN_URL,
         &[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
             ("redirect_uri", REDIRECT),
-            ("client_id", CLIENT_ID),
+            ("client_id", oauth.client_id.as_str()),
             ("code_verifier", verifier.as_str()),
         ],
+        Some(oauth.basic_token.as_str()),
     )
     .context("token exchange failed")?;
 
@@ -619,5 +725,52 @@ fn main() -> Result<()> {
         Cmd::Pull { path, date, out, user } => cmd_pull(path.as_deref(), date, out, user),
         Cmd::Status { user } => cmd_status(user),
         Cmd::Mcp => mcp_serve(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_url_is_the_web_api_host() {
+        assert_eq!(TOKEN_URL, "https://api.fitbit.com/oauth2/token");
+        assert!(!TOKEN_URL.contains("android-api"));
+    }
+
+    #[test]
+    fn parses_client_next_to_basic_token() {
+        // Percent-encoded the way accounts.fitbit.com embeds its config.
+        // The nearer clientId wins; 22C4DT is the retired id and must not be selected.
+        // basicToken here is base64("client"), not a real credential.
+        let page = concat!(
+            r#"<meta content="%7B%22other%22%3A%7B%22clientId%22%3A%2222C4DT%22%7D%2C"#,
+            r#"%22fitbit%22%3A%7B%22appId%22%3A%22228TQD%22%2C%22clientId%22%3A%22228TQF%22%2C"#,
+            r#"%22basicToken%22%3A%22Y2xpZW50%22%7D%7D"/>"#
+        );
+        let c = parse_oauth_client(page).unwrap();
+        assert_eq!(c.client_id, "228TQF");
+        assert_eq!(c.basic_token, "Y2xpZW50");
+    }
+
+    #[test]
+    fn live_token_host_rejects_bad_refresh_not_gone() {
+        let oauth = fetch_oauth_client().expect("accounts config");
+        assert_ne!(oauth.client_id, DATA_CLIENT_ID);
+        let err = post_form(
+            TOKEN_URL,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "invalid"),
+                ("client_id", oauth.client_id.as_str()),
+            ],
+            Some(oauth.basic_token.as_str()),
+        )
+        .expect_err("a dummy refresh must not succeed")
+        .to_string();
+        assert!(!err.contains(&oauth.basic_token), "error leaked the basic credential");
+        assert!(err.starts_with("400"), "{err}");
+        assert!(err.contains("invalid_grant"), "{err}");
+        assert!(!err.contains("410"), "{err}");
     }
 }

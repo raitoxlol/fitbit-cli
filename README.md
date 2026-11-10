@@ -3,10 +3,13 @@
 Pull your own Fitbit data, live, anytime — one small Rust binary, no Google
 Cloud project, no expiring credentials.
 
-It talks to `android-api.fitbit.com` — the private backend the real Fitbit app
-uses — with the same public OAuth client Fitbit's own tooling uses. One browser
-approval, then tokens self-rotate forever. That host outlives the legacy
-`api.fitbit.com` shutdown (Oct 30, 2026).
+Data reads go to `android-api.fitbit.com` — the private backend the real Fitbit
+app uses. Token exchange and refresh go to Fitbit's Web API token host,
+`https://api.fitbit.com/oauth2/token`. The old public Android client (`22C4DT`)
+is answered with HTTP 410 on every token host; auth uses the client id Fitbit's
+accounts site publishes, with PKCE. One browser approval, then tokens
+self-rotate. No Google Cloud project, and no client secret is stored in this
+repo.
 
 ## Install
 
@@ -75,11 +78,18 @@ Claude Desktop / Devin / Everett / Codex config:
 
 ## How auth works (and why nothing expires)
 
-PKCE + the public client_id Fitbit's own tooling uses — you approve once in a
-browser, the redirect to `localhost:8080` fails (expected), you paste the URL
-back. Tokens land in `~/.fitbit-export/tokens-{userId}.json` and refresh
-automatically on `android-api.fitbit.com/oauth2/token` — no client secret, no
-Google Cloud consent screen (that's where the 7-day expiry people hit comes
-from — this path doesn't have it).
+PKCE, plus the public client Fitbit's accounts site currently publishes. You
+approve once in a browser, the redirect to `localhost:8080` fails (expected),
+you paste the URL back. The code is exchanged at
+`https://api.fitbit.com/oauth2/token`. Tokens land in
+`~/.fitbit-export/tokens-{userId}.json` and refresh against that same host.
+The Basic credential is read from the public accounts page when a grant is
+made; it is not embedded in this repo. There is no Google Cloud consent screen
+(that's where the 7-day expiry people hit comes from — this path doesn't have
+it).
+
+Tokens saved before this change were issued to client `22C4DT`, which the token
+host now rejects with HTTP 410. Run `fitbit-cli auth` again before `status` or
+`pull`.
 
 Only reads your own account, only endpoints the app itself uses.

@@ -30,8 +30,15 @@ Windows on every `v*` tag.
 
 ```sh
 fitbit-cli auth        # prints a URL (and opens it in your browser if it can)
-                       # → sign in + approve → the localhost redirect fails
-                       # (expected) → copy the full URL → paste it back
+                       # → sign in + approve
+                       # → browser lands on accounts.fitbit.com/clienthandler
+                       #   (page may look blank or redirect — copy the full URL immediately)
+                       # → paste it back
+
+# headless, or no browser on this machine:
+fitbit-cli auth --url
+# open the printed URL where you can sign in, copy the full URL, then:
+fitbit-cli auth --complete 'https://accounts.fitbit.com/clienthandler?...'
 
 fitbit-cli status      # account, token freshness, tracker battery
 fitbit-cli pull today  # live data immediately
@@ -79,14 +86,24 @@ Claude Desktop / Devin / Everett / Codex config:
 ## How auth works (and why nothing expires)
 
 PKCE, plus the public client Fitbit's accounts site currently publishes. You
-approve once in a browser, the redirect to `localhost:8080` fails (expected),
-you paste the URL back. The code is exchanged at
-`https://api.fitbit.com/oauth2/token`. Tokens land in
-`~/.fitbit-export/tokens-{userId}.json` and refresh against that same host.
-The Basic credential is read from the public accounts page when a grant is
-made; it is not embedded in this repo. There is no Google Cloud consent screen
-(that's where the 7-day expiry people hit comes from — this path doesn't have
-it).
+approve once in a browser. The redirect is
+`https://accounts.fitbit.com/clienthandler` (override with `FITBIT_REDIRECT`;
+the same value is sent on the authorize URL and the token exchange). The page
+may look blank or redirect — copy the full URL immediately and paste it back.
+The authorization code can be in the query string or the `#` fragment. State
+is checked only when the redirect returns one.
+
+The code is exchanged at `https://api.fitbit.com/oauth2/token` with the Basic
+credential read from the public accounts page. If that host rejects the client
+or redirect, the exchange retries `https://web-api.fitbit.com/oauth2/token`
+without Basic. Tokens land in `~/.fitbit-export/tokens-{userId}.json` and
+refresh the same way. The Basic credential is not embedded in this repo and is
+never printed. There is no Google Cloud consent screen (that's where the
+7-day expiry people hit comes from — this path doesn't have it).
+
+Headless: `fitbit-cli auth --url` prints the authorize URL and saves the PKCE
+verifier and state under `~/.fitbit-export/` (mode `0600`). Finish with
+`fitbit-cli auth --complete '<pasted URL>'`.
 
 Tokens saved before this change were issued to client `22C4DT`, which the token
 host now rejects with HTTP 410. Run `fitbit-cli auth` again before `status` or

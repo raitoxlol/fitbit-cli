@@ -2,10 +2,12 @@
 //!
 //! Data reads go to the private app API (android-api.fitbit.com). Token
 //! exchange and refresh go to Fitbit's Web API token host
-//! (api.fitbit.com/oauth2/token). The old public Android client id is rejected
-//! there with HTTP 410; auth uses the client Fitbit's accounts site publishes,
-//! with PKCE. One OAuth approval, then tokens self-rotate — no Google Cloud
-//! project, no secret stored in this repo.
+//! (api.fitbit.com/oauth2/token), with a fallback to web-api.fitbit.com when
+//! that host rejects the client or redirect. The old public Android client id
+//! is rejected with HTTP 410; auth uses the client Fitbit's accounts site
+//! publishes, with PKCE, and redirects to accounts.fitbit.com/clienthandler.
+//! One OAuth approval, then tokens self-rotate — no Google Cloud project, no
+//! secret stored in this repo.
 
 use anyhow::{bail, Context, Result};
 use base64::Engine;
@@ -13,6 +15,7 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -22,10 +25,105 @@ const API: &str = "https://android-api.fitbit.com";
 /// Official Fitbit Web API token host. `android-api` returns HTTP 410 for
 /// token grants that still use the retired public client.
 const TOKEN_URL: &str = "https://api.fitbit.com/oauth2/token";
+/// Public PKCE token host used when api.fitbit.com rejects the accounts client
+/// or redirect. No Basic credential is sent here.
+const WEB_TOKEN_URL: &str = "https://web-api.fitbit.com/oauth2/token";
 const AUTHORIZE: &str = "https://www.fitbit.com/oauth2/authorize";
 /// Public accounts page whose config names the client the token host accepts.
 const ACCOUNTS_CONFIG: &str = "https://accounts.fitbit.com/";
-const REDIRECT: &str = "http://localhost:8080/callback";
+/// Redirect registered for the accounts site's own login client (228TQF).
+/// Override with FITBIT_REDIRECT when that value is refused; the same string
+/// is sent on the authorize URL and the token exchange.
+const REDIRECT: &str = "https://accounts.fitbit.com/clienthandler";
+
+/// `FITBIT_REDIRECT` when set to a non-empty value, otherwise [`REDIRECT`].
+fn redirect_from(override_val: Option<&str>) -> String {
+    override_val
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(REDIRECT)
+        .to_string()
+}
+
+fn redirect_uri() -> String {
+    redirect_from(std::env::var("FITBIT_REDIRECT").ok().as_deref())
+}
+
+fn authorize_url(client_id: &str, redirect: &str, state: &str, challenge: &str) -> String {
+    format!(
+        "{AUTHORIZE}?client_id={client_id}&redirect_uri={}&response_type=code&state={state}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
+        url::form_urlencoded::byte_serialize(redirect.as_bytes()).collect::<String>(),
+        url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
+    )
+}
+
+/// Query parameters, with `#` fragment values filling any key the query omitted.
+fn callback_params(pasted: &str) -> HashMap<String, String> {
+    let Ok(parsed) = url::Url::parse(pasted.trim()) else {
+        return HashMap::new();
+    };
+    let mut map: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+    if let Some(fragment) = parsed.fragment() {
+        for (k, v) in url::form_urlencoded::parse(fragment.as_bytes()) {
+            let key = k.into_owned();
+            let val = v.into_owned();
+            let missing = map.get(&key).map(|s| s.is_empty()).unwrap_or(true);
+            if missing && !val.is_empty() {
+                map.insert(key, val);
+            }
+        }
+    }
+    map
+}
+
+/// Pull `code` from the query string or the fragment.
+/// State is checked only when the redirect actually returned one.
+fn authorization_code(pasted: &str, expected_state: &str) -> Result<String> {
+    let params = callback_params(pasted);
+    let code = params
+        .get("code")
+        .map(String::as_str)
+        .filter(|c| !c.is_empty())
+        .context("no 'code' param in that URL")?
+        .to_string();
+    if let Some(got) = params.get("state").map(String::as_str).filter(|s| !s.is_empty()) {
+        if got != expected_state {
+            bail!("state mismatch — wrong URL?");
+        }
+    }
+    Ok(code)
+}
+
+/// True when the token host rejected the client credential or redirect_uri.
+/// `invalid_grant` and generic `invalid_request` stay on the original host.
+fn token_error_needs_web_fallback(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("invalid_client")
+        || e.contains("invalid client")
+        || e.contains("unauthorized_client")
+        || e.contains("unauthorized client")
+        || e.contains("redirect_uri")
+        || e.contains("invalid_redirect")
+        || e.contains("invalid redirect")
+}
+
+fn auth_paste_prompt(redirect: &str) -> String {
+    format!(
+        "After approving, the browser lands on {redirect}.\n\
+The page may look blank or redirect — copy the full URL immediately and paste it here: "
+    )
+}
+
+/// PKCE session for `auth --url` / `auth --complete`. The Basic credential is
+/// never written here; it is re-read from the accounts page at exchange time.
+#[derive(Serialize, Deserialize)]
+struct PendingAuth {
+    verifier: String,
+    state: String,
+    redirect: String,
+    client_id: String,
+}
+
 /// Sent on data reads only. Token grants must not use this id: Fitbit answers
 /// `client_id=22C4DT` with HTTP 410 on every token host.
 const DATA_CLIENT_ID: &str = "22C4DT";
@@ -34,6 +132,7 @@ const SCOPES: &str = "activity heartrate location nutrition oxygen_saturation \
 
 /// Public OAuth client published on the Fitbit accounts page. `basic_token` is
 /// the opaque Basic credential from that page — never log it.
+#[derive(Clone)]
 struct OauthClient {
     client_id: String,
     basic_token: String,
@@ -228,18 +327,66 @@ fn post_form(url: &str, form: &[(&str, &str)], basic: Option<&str>) -> Result<Va
     serde_json::from_str(&body).context("token endpoint returned non-JSON")
 }
 
+fn redact_secrets(msg: &str, secrets: &[&str]) -> String {
+    let mut out = msg.to_string();
+    for secret in secrets {
+        if !secret.is_empty() {
+            out = out.replace(secret, "[redacted]");
+        }
+    }
+    out
+}
+
+fn grant_secrets<'a>(oauth: &'a OauthClient, form: &'a [(&str, &str)]) -> Vec<&'a str> {
+    let mut secrets = vec![oauth.basic_token.as_str()];
+    for (key, value) in form {
+        if matches!(*key, "code" | "code_verifier" | "refresh_token" | "access_token") {
+            secrets.push(*value);
+        }
+    }
+    secrets
+}
+
+/// POST a token grant to api.fitbit.com with Basic auth. On invalid client or
+/// redirect errors, retry web-api.fitbit.com without Basic. Logs the host
+/// switch and the redacted error — never the basic token, code, or verifier.
+fn post_token(oauth: &OauthClient, form: &[(&str, &str)], what: &str) -> Result<Value> {
+    let secrets = grant_secrets(oauth, form);
+    match post_form(TOKEN_URL, form, Some(oauth.basic_token.as_str())) {
+        Ok(body) => Ok(body),
+        Err(err) => {
+            let msg = redact_secrets(&err.to_string(), &secrets);
+            if !token_error_needs_web_fallback(&msg) {
+                bail!("{what} failed: {msg}");
+            }
+            eprintln!(
+                "{what}: api.fitbit.com rejected the client or redirect ({msg}); retrying {WEB_TOKEN_URL} without Basic"
+            );
+            match post_form(WEB_TOKEN_URL, form, None) {
+                Ok(body) => {
+                    eprintln!("{what}: web-api.fitbit.com accepted the grant");
+                    Ok(body)
+                }
+                Err(err) => {
+                    let msg = redact_secrets(&err.to_string(), &secrets);
+                    bail!("{what} on web-api.fitbit.com failed: {msg}");
+                }
+            }
+        }
+    }
+}
+
 fn refresh_tokens(path: &Path, t: &mut Tokens) -> Result<()> {
     let oauth = oauth_client()?;
-    let resp = post_form(
-        TOKEN_URL,
+    let resp = post_token(
+        oauth,
         &[
             ("grant_type", "refresh_token"),
             ("refresh_token", t.refresh_token.as_str()),
             ("client_id", oauth.client_id.as_str()),
         ],
-        Some(oauth.basic_token.as_str()),
-    )
-    .context("refresh rejected")?;
+        "refresh",
+    )?;
     t.access_token = resp["access_token"]
         .as_str()
         .context("refresh response missing access_token")?
@@ -296,54 +443,77 @@ fn pull(path: &str, user: Option<&str>) -> Result<(u16, String)> {
     Ok((status, body))
 }
 
-fn cmd_auth() -> Result<()> {
-    let oauth = oauth_client()?;
-    let verifier = random_b64(64)?;
-    let challenge = {
-        let mut h = Sha256::new();
-        h.update(verifier.as_bytes());
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
-    };
-    let state = url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect::<String>();
-    let url = format!(
-        "{AUTHORIZE}?client_id={}&redirect_uri={}&response_type=code&state={state}&scope={}&code_challenge={challenge}&code_challenge_method=S256",
-        oauth.client_id,
-        url::form_urlencoded::byte_serialize(REDIRECT.as_bytes()).collect::<String>(),
-        url::form_urlencoded::byte_serialize(SCOPES.as_bytes()).collect::<String>(),
-    );
-    println!("Open this URL in any browser to authorize:\n{url}\n");
-    if try_open_browser(&url) {
-        eprintln!("(opened in your default browser)");
-    }
-    print!("After approving, the browser lands on a localhost:8080 URL that fails to\nload — copy the full URL and paste it here: ");
-    std::io::stdout().flush()?;
-    let mut pasted = String::new();
-    std::io::stdin().lock().read_line(&mut pasted)?;
-    let pasted = pasted.trim();
-    let q = url::Url::parse(pasted)
-        .ok()
-        .and_then(|u| u.query_pairs().into_owned().collect::<std::collections::HashMap<_, _>>().into());
-    let q: std::collections::HashMap<String, String> = q.unwrap_or_default();
-    let code = q.get("code").cloned().unwrap_or_default();
-    if code.is_empty() {
-        bail!("no 'code' param in that URL");
-    }
-    if q.get("state").map(String::as_str) != Some(state.as_str()) {
-        bail!("state mismatch — wrong URL?");
-    }
+fn pkce_challenge(verifier: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(verifier.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(h.finalize())
+}
 
-    let td = post_form(
-        TOKEN_URL,
+fn pending_path() -> Result<PathBuf> {
+    Ok(tokens_dir()?.join(".pending-auth.json"))
+}
+
+fn save_pending(pending: &PendingAuth) -> Result<()> {
+    let dir = tokens_dir()?;
+    fs::create_dir_all(&dir)?;
+    set_private_perms(&dir, 0o700);
+    let p = pending_path()?;
+    let tmp = p.with_file_name(".pending-auth.json.tmp");
+    fs::write(&tmp, serde_json::to_string_pretty(pending)?)?;
+    set_private_perms(&tmp, 0o600);
+    fs::rename(&tmp, &p)?;
+    Ok(())
+}
+
+fn load_pending() -> Result<PendingAuth> {
+    let p = pending_path()?;
+    let raw = fs::read_to_string(&p).with_context(|| {
+        format!(
+            "no pending auth at {} — run `fitbit-cli auth --url` first",
+            p.display()
+        )
+    })?;
+    serde_json::from_str(&raw).context("bad pending-auth file")
+}
+
+fn new_pending(oauth: &OauthClient) -> Result<PendingAuth> {
+    Ok(PendingAuth {
+        verifier: random_b64(64)?,
+        state: url::form_urlencoded::byte_serialize(random_b64(32)?.as_bytes()).collect(),
+        redirect: redirect_uri(),
+        client_id: oauth.client_id.clone(),
+    })
+}
+
+fn exchange_client(oauth: &OauthClient, pending: &PendingAuth) -> OauthClient {
+    if oauth.client_id == pending.client_id {
+        return oauth.clone();
+    }
+    eprintln!(
+        "token exchange: accounts client id is now {} (authorize URL used {}); sending the saved id",
+        oauth.client_id, pending.client_id
+    );
+    OauthClient {
+        client_id: pending.client_id.clone(),
+        basic_token: oauth.basic_token.clone(),
+    }
+}
+
+fn finish_auth(pasted: &str, pending: &PendingAuth) -> Result<()> {
+    let oauth = oauth_client()?;
+    let oauth = exchange_client(oauth, pending);
+    let code = authorization_code(pasted, &pending.state)?;
+    let td = post_token(
+        &oauth,
         &[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
-            ("redirect_uri", REDIRECT),
-            ("client_id", oauth.client_id.as_str()),
-            ("code_verifier", verifier.as_str()),
+            ("redirect_uri", pending.redirect.as_str()),
+            ("client_id", pending.client_id.as_str()),
+            ("code_verifier", pending.verifier.as_str()),
         ],
-        Some(oauth.basic_token.as_str()),
-    )
-    .context("token exchange failed")?;
+        "token exchange",
+    )?;
 
     let access = td["access_token"]
         .as_str()
@@ -372,6 +542,49 @@ fn cmd_auth() -> Result<()> {
     println!("\nSaved {}\nAuthorized: {} ({})", p.display(), t.display_name, t.user_id);
     println!("Now: `fitbit-cli pull today` — or `fitbit-cli mcp` for agents.");
     Ok(())
+}
+
+fn cmd_auth(url_only: bool, complete: Option<String>) -> Result<()> {
+    if let Some(pasted) = complete {
+        let pending = load_pending()?;
+        finish_auth(&pasted, &pending)?;
+        if let Ok(p) = pending_path() {
+            let _ = fs::remove_file(p);
+        }
+        return Ok(());
+    }
+
+    let oauth = oauth_client()?;
+    let pending = new_pending(oauth)?;
+    let url = authorize_url(
+        &pending.client_id,
+        &pending.redirect,
+        &pending.state,
+        &pkce_challenge(&pending.verifier),
+    );
+
+    if url_only {
+        save_pending(&pending)?;
+        println!("{url}");
+        eprintln!(
+            "\nSaved PKCE verifier and state (redirect {}).\n\
+Open that URL, approve, then copy the full URL immediately.\n\
+The page may look blank or redirect.\n\
+Finish with:\n  fitbit-cli auth --complete '<pasted URL>'",
+            pending.redirect
+        );
+        return Ok(());
+    }
+
+    println!("Open this URL in any browser to authorize:\n{url}\n");
+    if try_open_browser(&url) {
+        eprintln!("(opened in your default browser)");
+    }
+    print!("{}", auth_paste_prompt(&pending.redirect));
+    std::io::stdout().flush()?;
+    let mut pasted = String::new();
+    std::io::stdin().lock().read_line(&mut pasted)?;
+    finish_auth(pasted.trim(), &pending)
 }
 
 /// Best-effort browser open; false if the platform opener failed.
@@ -694,7 +907,15 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// One-time OAuth (approve in browser, paste back the URL)
-    Auth,
+    Auth {
+        /// Print the authorize URL and save the PKCE verifier and state, then exit.
+        /// Finish later with `fitbit-cli auth --complete <url>`.
+        #[arg(long, conflicts_with = "complete")]
+        url: bool,
+        /// Finish an auth started with `--url`, using the pasted redirect URL.
+        #[arg(long, value_name = "PASTED_URL")]
+        complete: Option<String>,
+    },
     /// Live pull: `fitbit-cli pull today` or a raw API path
     Pull {
         /// Shortcut name or raw API path (omit to list shortcuts)
@@ -721,7 +942,7 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Auth => cmd_auth(),
+        Cmd::Auth { url, complete } => cmd_auth(url, complete),
         Cmd::Pull { path, date, out, user } => cmd_pull(path.as_deref(), date, out, user),
         Cmd::Status { user } => cmd_status(user),
         Cmd::Mcp => mcp_serve(),
@@ -733,8 +954,167 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_redirect_is_accounts_clienthandler() {
+        assert_eq!(REDIRECT, "https://accounts.fitbit.com/clienthandler");
+        assert_eq!(redirect_from(None), REDIRECT);
+        assert_eq!(redirect_from(Some("  ")), REDIRECT);
+        assert_eq!(
+            redirect_from(Some("https://example.com/cb")),
+            "https://example.com/cb"
+        );
+        assert_eq!(redirect_uri(), REDIRECT);
+    }
+
+    #[test]
+    fn authorize_url_uses_client_and_redirect() {
+        let url = authorize_url("228TQF", REDIRECT, "STATE", "CHALLENGE");
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.scheme(), "https");
+        assert_eq!(parsed.host_str(), Some("www.fitbit.com"));
+        assert_eq!(parsed.path(), "/oauth2/authorize");
+        let q: std::collections::HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(q.get("client_id").map(String::as_str), Some("228TQF"));
+        assert_eq!(
+            q.get("redirect_uri").map(String::as_str),
+            Some("https://accounts.fitbit.com/clienthandler")
+        );
+        assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(q.get("state").map(String::as_str), Some("STATE"));
+        assert_eq!(q.get("code_challenge").map(String::as_str), Some("CHALLENGE"));
+        assert_eq!(q.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert!(q.get("scope").is_some_and(|s| s.contains("profile")));
+        assert!(!url.contains("localhost"));
+
+        let custom = "https://accounts.fitbit.com/clienthandler?x=1";
+        let custom_url = authorize_url("228TQF", custom, "s", "c");
+        let custom_q: std::collections::HashMap<_, _> = url::Url::parse(&custom_url)
+            .unwrap()
+            .query_pairs()
+            .into_owned()
+            .collect();
+        assert_eq!(custom_q.get("redirect_uri").map(String::as_str), Some(custom));
+    }
+
+    #[test]
+    fn callback_reads_code_and_state_from_query_or_fragment() {
+        let query = "https://accounts.fitbit.com/clienthandler?code=from-query&state=abc";
+        let q = callback_params(query);
+        assert_eq!(q.get("code").map(String::as_str), Some("from-query"));
+        assert_eq!(q.get("state").map(String::as_str), Some("abc"));
+
+        let frag = "https://accounts.fitbit.com/clienthandler#code=from-frag&state=xyz";
+        let f = callback_params(frag);
+        assert_eq!(f.get("code").map(String::as_str), Some("from-frag"));
+        assert_eq!(f.get("state").map(String::as_str), Some("xyz"));
+
+        let both = "https://accounts.fitbit.com/clienthandler?targetUrl=https%3A%2F%2Fwww.fitbit.com%2F#code=frag-code&state=s1";
+        let b = callback_params(both);
+        assert_eq!(b.get("code").map(String::as_str), Some("frag-code"));
+        assert_eq!(b.get("state").map(String::as_str), Some("s1"));
+        assert_eq!(
+            b.get("targetUrl").map(String::as_str),
+            Some("https://www.fitbit.com/")
+        );
+    }
+
+    #[test]
+    fn state_checked_only_when_it_comes_back() {
+        let expected = "expected-state";
+        assert_eq!(
+            authorization_code(
+                "https://accounts.fitbit.com/clienthandler#code=abc",
+                expected
+            )
+            .unwrap(),
+            "abc"
+        );
+        assert_eq!(
+            authorization_code(
+                "https://accounts.fitbit.com/clienthandler?code=abc&state=expected-state",
+                expected
+            )
+            .unwrap(),
+            "abc"
+        );
+        let mismatch = authorization_code(
+            "https://accounts.fitbit.com/clienthandler?code=abc&state=nope",
+            expected,
+        );
+        assert!(mismatch.is_err(), "mismatched state must be rejected");
+        let frag_mismatch = authorization_code(
+            "https://accounts.fitbit.com/clienthandler#code=abc&state=nope",
+            expected,
+        );
+        assert!(frag_mismatch.is_err(), "fragment state must be checked too");
+        let missing = authorization_code("https://accounts.fitbit.com/clienthandler", expected);
+        assert!(missing.is_err(), "a URL with no code must be rejected");
+    }
+
+    #[test]
+    fn web_api_fallback_only_for_client_or_redirect_errors() {
+        assert!(token_error_needs_web_fallback(
+            "401 Unauthorized: {\"errors\":[{\"errorType\":\"invalid_client\",\"message\":\"Invalid authorization header.\"}]}"
+        ));
+        assert!(token_error_needs_web_fallback(
+            "400 Bad Request: invalid redirect_uri parameter value"
+        ));
+        assert!(token_error_needs_web_fallback("400: unauthorized_client"));
+        assert!(token_error_needs_web_fallback(
+            "400: Invalid Client credentials"
+        ));
+        assert!(!token_error_needs_web_fallback("400 Bad Request: invalid_grant"));
+        assert!(!token_error_needs_web_fallback(
+            "400: invalid_request missing code"
+        ));
+    }
+
+    #[test]
+    fn paste_prompt_names_clienthandler() {
+        let prompt = auth_paste_prompt(REDIRECT);
+        assert!(prompt.contains("accounts.fitbit.com/clienthandler"));
+        assert!(prompt.to_ascii_lowercase().contains("blank"));
+        assert!(prompt.to_ascii_lowercase().contains("redirect"));
+        assert!(prompt.to_ascii_lowercase().contains("immediately"));
+        assert!(prompt.contains("copy the full URL"));
+        assert!(!prompt.contains("localhost"));
+    }
+
+    #[test]
+    fn redact_secrets_strips_basic_token_and_grant() {
+        let msg = redact_secrets(
+            "400: bad Y2xpZW50 and code abcdefghijklmnop",
+            &["Y2xpZW50", "abcdefghijklmnop", ""],
+        );
+        assert!(!msg.contains("Y2xpZW50"));
+        assert!(!msg.contains("abcdefghijklmnop"));
+        assert!(msg.contains("[redacted]"));
+    }
+
+    #[test]
+    fn pending_auth_saves_pkce_without_basic_token() {
+        let pending = PendingAuth {
+            verifier: "verifier-secret".into(),
+            state: "state-value".into(),
+            redirect: "https://accounts.fitbit.com/clienthandler".into(),
+            client_id: "228TQF".into(),
+        };
+        let raw = serde_json::to_string(&pending).unwrap();
+        assert!(raw.contains("verifier-secret"));
+        assert!(raw.contains("state-value"));
+        assert!(raw.contains("https://accounts.fitbit.com/clienthandler"));
+        assert!(!raw.contains("basicToken"));
+        assert!(!raw.contains("basic_token"));
+        let restored: PendingAuth = serde_json::from_str(&raw).unwrap();
+        assert_eq!(restored.redirect, pending.redirect);
+        assert_eq!(restored.verifier, pending.verifier);
+        assert_eq!(restored.state, pending.state);
+        assert_eq!(restored.client_id, pending.client_id);
+    }
+
+    #[test]
     fn token_url_is_the_web_api_host() {
         assert_eq!(TOKEN_URL, "https://api.fitbit.com/oauth2/token");
+        assert_eq!(WEB_TOKEN_URL, "https://web-api.fitbit.com/oauth2/token");
         assert!(!TOKEN_URL.contains("android-api"));
     }
 

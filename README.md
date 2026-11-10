@@ -1,15 +1,31 @@
 # fitbit-cli
 
 Pull your own Fitbit data, live, anytime — one small Rust binary, no Google
-Cloud project, no expiring credentials.
+Cloud project, no client secret in this repo.
 
-Data reads go to `android-api.fitbit.com` — the private backend the real Fitbit
-app uses. Token exchange and refresh go to Fitbit's Web API token host,
-`https://api.fitbit.com/oauth2/token`. The old public Android client (`22C4DT`)
-is answered with HTTP 410 on every token host; auth uses the client id Fitbit's
-accounts site publishes, with PKCE. One browser approval, then tokens
-self-rotate. No Google Cloud project, and no client secret is stored in this
-repo.
+## What broke
+
+Release v0.1.1 exchanges and refreshes tokens with the retired public Android
+client `22C4DT` at `android-api.fitbit.com/oauth2/token`. Fitbit now answers
+that grant with HTTP 410 Gone. The same client also gets 410 from
+`api.fitbit.com/oauth2/token`. A dummy refresh with the client Fitbit's
+accounts page publishes comes back `400 invalid_grant` instead, so the host is
+up and the failure is the retired client. Every install of v0.1.1 hits this.
+It is not limited to one account. Tokens saved by v0.1.1 cannot be refreshed.
+Run `auth` again after upgrading.
+
+v0.1.2 reads the current client from `https://accounts.fitbit.com/` and sends
+the browser to `https://www.fitbit.com/oauth2/authorize` with redirect
+`https://accounts.fitbit.com/clienthandler`. If `api.fitbit.com` rejects that
+client or redirect, token exchange retries `web-api.fitbit.com` without a
+Basic credential. Data reads stay on `android-api.fitbit.com`.
+
+Checked on November 10, 2026: the accounts-page client and redirect are
+accepted (authorize URL returns the login transfer page, and a fake code is
+`invalid_grant` rather than `invalid_client`). An existing session for one
+account still reads profile and device status with this build. A brand-new
+browser sign-in was not repeated for a second account. Accounts that cannot
+use Fitbit's web login are outside what was tested.
 
 ## Install
 

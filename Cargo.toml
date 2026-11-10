@@ -1,6 +1,6 @@
 [package]
 name = "fitbit-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Pull your own Fitbit data, live, anytime — via the private app API. No Google Cloud project, no expiring credentials."
 license = "MIT"
